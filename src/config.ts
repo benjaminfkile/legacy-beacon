@@ -12,7 +12,9 @@ export interface Config {
   pollMs: number;
   logLevel: string;
   forceLeader: boolean;
-  gatewayRealtimeToken: string;
+  // Required only when forceLeader is false — a forced leader never polls
+  // /internal/leader, and the local recipe runs without a gateway.
+  gatewayRealtimeToken: string | null;
 }
 
 export class ConfigError extends Error {
@@ -32,7 +34,6 @@ const REQUIRED_KEYS = [
   "LB_SOURCE_URL",
   "LB_POLL_MS",
   "LB_LOG_LEVEL",
-  "GATEWAY_REALTIME_TOKEN",
 ] as const;
 
 function isNonEmpty(v: string | undefined): v is string {
@@ -99,6 +100,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // LB_FORCE_LEADER is a local-only override and is refused when LB_ENV is prod.
   if (envValue === "prod" && forceLeader) bad.push("LB_FORCE_LEADER");
 
+  // GATEWAY_REALTIME_TOKEN is only used to authenticate GET /internal/leader.
+  // A forced leader never polls that endpoint, so the token is optional in that
+  // mode; every other run requires it.
+  if (!forceLeader && !isNonEmpty(env.GATEWAY_REALTIME_TOKEN))
+    bad.push("GATEWAY_REALTIME_TOKEN");
+
   const uniqueBad = Array.from(new Set(bad));
   if (uniqueBad.length > 0) {
     throw new ConfigError(
@@ -118,6 +125,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     pollMs,
     logLevel: env.LB_LOG_LEVEL!,
     forceLeader,
-    gatewayRealtimeToken: env.GATEWAY_REALTIME_TOKEN!,
+    gatewayRealtimeToken: isNonEmpty(env.GATEWAY_REALTIME_TOKEN)
+      ? env.GATEWAY_REALTIME_TOKEN
+      : null,
   };
 }

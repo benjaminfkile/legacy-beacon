@@ -80,6 +80,11 @@ async function main(): Promise<void> {
       key: config.beaconKey,
       state,
       onConnected: () => sendLoop?.wake(),
+      onBuildError: (err) =>
+        log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          "hub build failed; backing off",
+        ),
     });
     sendLoop = startSendLoop({
       state,

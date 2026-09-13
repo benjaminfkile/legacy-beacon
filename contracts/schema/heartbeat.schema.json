@@ -1,25 +1,39 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://wmsfo.org/schema/heartbeat.schema.json",
-  "title": "HeartbeatBody",
-  "description": "Body of POST /beacons/heartbeat per contracts 4.2.",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["sentAt"],
   "properties": {
-    "sentAt": { "type": "string", "format": "date-time" },
-    "health": {
-      "type": ["object", "null"],
-      "additionalProperties": false,
-      "properties": {
-        "batteryPercent": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
-        "lastFixAgeS": { "type": ["number", "null"], "minimum": 0 },
-        "socketState": {
-          "type": ["string", "null"],
-          "enum": ["connected", "connecting", "reconnecting", "disconnected", null]
-        }
-      }
+    "sentAt": {
+      "type": "string",
+      "format": "date-time"
     },
-    "debug": { "type": ["object", "null"] }
-  }
+    "health": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "batteryPercent": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lastFixAgeS": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "socketState": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "debug": true
+  },
+  "additionalProperties": false
 }

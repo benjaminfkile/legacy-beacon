@@ -7,9 +7,9 @@
 // contents with line endings normalized to LF. GITHUB_TOKEN is used when
 // present to raise the rate limit and reach private repositories.
 //
-// When the network is unreachable in the local environment the check prints a
-// warning and exits 0 so `npm run contracts:check` still passes for local dev;
-// CI sees the network and enforces the comparison strictly.
+// A fetch failure is a failure: exit 1 with the HTTP status (or the network
+// error). Skipping the strict comparison on a 404 would let CI pass on a wrong
+// owner or a deleted commit; the check has to be enforced everywhere it runs.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const REPO_OWNER = "wmsfo";
+const REPO_OWNER = "benjaminfkile";
 const REPO_NAME = "wmsfo-api";
 const SUBTREE = "contracts";
 
@@ -30,10 +30,6 @@ const shaFile = join(repoRoot, "CONTRACTS_SHA");
 function die(msg, code = 1) {
   process.stderr.write(`check-contracts: ${msg}\n`);
   process.exit(code);
-}
-
-function warn(msg) {
-  process.stderr.write(`check-contracts: ${msg}\n`);
 }
 
 function readSha() {
@@ -128,9 +124,7 @@ async function main() {
 
   const fetched = await fetchTarball(sha);
   if (!fetched.ok) {
-    warn(`skipping strict comparison — ${fetched.reason}`);
-    warn(`local vendored contracts/ has CONTRACTS_VERSION ${readContractsVersion() ?? "?"}`);
-    process.exit(0);
+    die(fetched.reason);
   }
 
   const tmp = mkdtempSync(join(tmpdir(), "contracts-check-"));
@@ -138,16 +132,14 @@ async function main() {
   try {
     remoteDir = extractTar(fetched.buf, tmp);
   } catch (err) {
-    warn(`skipping strict comparison — extraction failed: ${err instanceof Error ? err.message : String(err)}`);
     rmSync(tmp, { recursive: true, force: true });
-    process.exit(0);
+    die(`extraction failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   let ok = true;
   try {
     if (!existsDir(remoteDir)) {
-      warn(`no ${SUBTREE}/ subtree at ${REPO_OWNER}/${REPO_NAME}@${sha}; skipping`);
-      process.exit(0);
+      die(`no ${SUBTREE}/ subtree at ${REPO_OWNER}/${REPO_NAME}@${sha}`);
     }
     const localFiles = new Map();
     for (const p of walk(localContracts)) localFiles.set(relative(localContracts, p), p);
@@ -187,14 +179,6 @@ function existsDir(p) {
     return statSync(p).isDirectory();
   } catch {
     return false;
-  }
-}
-
-function readContractsVersion() {
-  try {
-    return readFileSync(join(localContracts, "CONTRACTS_VERSION"), "utf8").trim();
-  } catch {
-    return null;
   }
 }
 

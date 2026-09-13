@@ -90,6 +90,41 @@ describe("socket loop transitions", () => {
     expect(sleepCalls[0]).toBe(JOIN_DENIED_FIRST_WAIT_MS);
   });
 
+  it("survives a build() throw: reports, backs off, and retries", async () => {
+    const state = createBeaconState();
+    const sleepCalls: number[] = [];
+    let buildCalls = 0;
+    const buildErrors: unknown[] = [];
+    let loopHandle!: { stop(): Promise<void> };
+    loopHandle = startSocketLoop({
+      build: () => {
+        buildCalls += 1;
+        if (buildCalls === 1) throw new Error("Cannot resolve wss://…");
+        // Second build returns a working fake so the loop reaches "connected"
+        // and we know the loop kept running after the first throw.
+        return new FakeHubClient();
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      onBuildError: (err) => buildErrors.push(err),
+      sleep: async (ms) => {
+        sleepCalls.push(ms);
+        // Stop as soon as the second attempt has connected so the test ends.
+        if (state.socketState === "connected") await loopHandle.stop();
+      },
+    });
+    await drain();
+    // The first attempt threw; the loop reported the error, waited backoffMs(0)
+    // = 1000 ms, then built a working hub and reached "connected".
+    expect(buildCalls).toBeGreaterThanOrEqual(2);
+    expect(buildErrors.length).toBe(1);
+    expect((buildErrors[0] as Error).message).toMatch(/Cannot resolve/);
+    expect(sleepCalls[0]).toBe(1000);
+    await loopHandle.stop();
+    expect(state.socketState).toBe("disconnected");
+  });
+
   it("emits reconnecting on a channelEvicted", async () => {
     const state = createBeaconState();
     let hub!: FakeHubClient;

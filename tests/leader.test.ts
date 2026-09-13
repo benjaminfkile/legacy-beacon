@@ -82,7 +82,7 @@ describe("leader poll (contracts 7.5)", () => {
   it("LB_FORCE_LEADER=true makes the node leader without a gateway", async () => {
     const leader = startLeader({
       gatewayInternalUrl: "http://unused",
-      realtimeToken: "unused",
+      realtimeToken: null,
       forceLeader: true,
       pollMs: 60_000,
       autoStart: false,

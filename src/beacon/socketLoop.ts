@@ -16,6 +16,7 @@ export interface SocketLoopOptions {
   state: BeaconState;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  onBuildError?: (err: unknown) => void;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -53,7 +54,21 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
   async function loop(): Promise<void> {
     while (!stopped) {
       state.socketState = "connecting";
-      const client = opts.build();
+      let client: HubClient;
+      try {
+        client = opts.build();
+      } catch (err) {
+        // A build() throw (bad URL, misconfigured transport, …) is treated the
+        // same as a failed start: report, backoff, retry. Letting it escape
+        // would kill the loop and strand the beacon.
+        opts.onBuildError?.(err);
+        state.socketState = "reconnecting";
+        opts.onDisconnected?.();
+        const delay = backoffMs(attempt);
+        attempt += 1;
+        if (delay > 0) await sleep(delay);
+        continue;
+      }
       current = client;
       let deniedNext = false;
       let evictedNextAttempt: number | null = null;
@@ -107,9 +122,10 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
     }
   }
 
-  // The loop never throws out; a stray failure would only mean stop() raced
-  // with a build() throw. Kick it off in the microtask queue so the caller
-  // returns a handle before the first `state.socketState = "connecting"`.
+  // The loop never throws out: build() throws are caught and treated like a
+  // failed start (log, backoff, retry). Kick it off in the microtask queue so
+  // the caller returns a handle before the first `state.socketState =
+  // "connecting"`.
   void Promise.resolve().then(loop);
 
   return {
