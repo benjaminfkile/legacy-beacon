@@ -1,8 +1,11 @@
 // Boot: load config, start the health server, start the leader poll, start the
-// beacon core on the leader. A stub fix source stands in for L2's poller: it
-// leaves the state's latestFix untouched, so the send loop naturally idles
-// until L2 wires the legacy poller in.
+// beacon core on the leader. The legacy Heroku poller is the fix source; the
+// heartbeat carries the `health` core and the `debug` object of
+// legacy-beacon.md section 5.
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import pino from "pino";
 import { loadConfig, ConfigError } from "./config.js";
 import { startLeader, type Leader } from "./leader.js";
@@ -13,7 +16,21 @@ import { buildHubClient, type HubClient } from "./beacon/hub.js";
 import { startSocketLoop, type SocketLoop } from "./beacon/socketLoop.js";
 import { startSendLoop, type SendLoop } from "./beacon/sendLoop.js";
 import { startHeartbeatLoop, type HeartbeatLoop } from "./beacon/heartbeatLoop.js";
-import { createStubFixSource, type FixSource } from "./source/stub.js";
+import { createPoller, type Poller } from "./source/poller.js";
+import { buildHeartbeatDebug, buildHeartbeatHealth } from "./heartbeat.js";
+
+function readVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // src/main.ts and dist/main.js both sit one level below the repo root.
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as {
+      version?: string;
+    };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 async function main(): Promise<void> {
   const config = (() => {
@@ -29,6 +46,9 @@ async function main(): Promise<void> {
   })();
 
   const log = pino({ level: config.logLevel });
+  const version = readVersion();
+  const bootMs = Date.now();
+  const instance = process.env.HOSTNAME ?? "local";
 
   let leader: Leader | null = null;
   const health = startHealthServer(
@@ -46,7 +66,7 @@ async function main(): Promise<void> {
   let socket: SocketLoop | null = null;
   let sendLoop: SendLoop | null = null;
   let heartbeat: HeartbeatLoop | null = null;
-  let source: FixSource | null = null;
+  let poller: Poller | null = null;
 
   function startCore() {
     if (socket) return;
@@ -67,15 +87,35 @@ async function main(): Promise<void> {
       getHub: () => hub,
       ingestChannel: config.ingestChannel,
     });
-    heartbeat = startHeartbeatLoop({ state, rest });
-    source = createStubFixSource({ state, onFix: () => sendLoop?.wake() });
-    source.start();
+    poller = createPoller({
+      url: config.sourceUrl,
+      pollMs: config.pollMs,
+      state,
+      onFix: () => sendLoop?.wake(),
+    });
+    poller.start();
+    heartbeat = startHeartbeatLoop({
+      state,
+      rest,
+      buildHealth: () =>
+        buildHeartbeatHealth({ state, pollerStats: poller?.stats() ?? null }),
+      buildDebug: () =>
+        buildHeartbeatDebug({
+          state,
+          config,
+          pollerStats: poller?.stats() ?? null,
+          bootMs,
+          version,
+          instance,
+          leader: leader?.isLeader() ?? false,
+        }),
+    });
   }
 
   async function stopCore() {
     if (!socket) return;
     log.info("stopping beacon core");
-    source?.stop();
+    poller?.stop();
     sendLoop?.stop();
     heartbeat?.stop();
     await socket.stop();
@@ -83,7 +123,7 @@ async function main(): Promise<void> {
     sendLoop = null;
     heartbeat = null;
     hub = null;
-    source = null;
+    poller = null;
   }
 
   leader = startLeader({
