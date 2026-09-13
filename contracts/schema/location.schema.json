@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wmsfo.org/schema/location.schema.json",
+  "title": "LocationPayload",
+  "description": "Body of POST /locations and SendToChannel(\"location\", ...) per contracts 4.2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lat", "lng", "recordedAt"],
+  "properties": {
+    "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+    "lng": { "type": "number", "minimum": -180, "maximum": 180 },
+    "recordedAt": { "type": "string", "format": "date-time" },
+    "speedMps": { "type": ["number", "null"], "minimum": 0, "maximum": 500 },
+    "altitudeM": { "type": ["number", "null"], "minimum": -500, "maximum": 20000 },
+    "headingDeg": { "type": ["number", "null"], "minimum": 0, "maximum": 360 },
+    "accuracyM": { "type": ["number", "null"], "minimum": 0, "maximum": 100000 }
+  }
+}
