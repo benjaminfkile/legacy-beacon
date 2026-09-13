@@ -124,8 +124,95 @@ describe("socket loop transitions", () => {
     await loopHandle.stop();
     expect(state.socketState).toBe("disconnected");
   });
+});
 
-  it("emits reconnecting on a channelEvicted", async () => {
+describe("hub ChannelEvent envelope routing (contracts 2.3, 9.2)", () => {
+  // The gateway's one client method is `ChannelEvent`. The socket loop routes
+  // envelopes on `envelope.channel` and `envelope.event`, and ignores anything
+  // outside the ingest channel it joined.
+
+  class CountingHub extends FakeHubClient {
+    public joinCount = 0;
+    override invoke<T = unknown>(method: string, ...args: unknown[]): Promise<T> {
+      if (method === "JoinPrivateChannel") {
+        this.joinCount += 1;
+        return Promise.resolve(undefined as unknown as T);
+      }
+      return super.invoke<T>(method, ...args);
+    }
+  }
+
+  it("routes a 'joined' envelope on the ingest channel to 'connected' even before invoke resolves", async () => {
+    const state = createBeaconState();
+    let hub!: FakeHubClient;
+    const joinResolvers: Array<() => void> = [];
+    class Slow extends FakeHubClient {
+      override invoke<T = unknown>(method: string, ..._args: unknown[]): Promise<T> {
+        if (method === "JoinPrivateChannel") {
+          return new Promise<T>((resolve) => {
+            joinResolvers.push(() => resolve(undefined as unknown as T));
+          });
+        }
+        return super.invoke<T>(method, ..._args);
+      }
+    }
+    const loop = startSocketLoop({
+      build: () => (hub = new Slow()),
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await drain();
+    expect(state.socketState).toBe("connecting");
+    hub.emit("ChannelEvent", {
+      channel: "x:ingest",
+      event: "joined",
+      data: { channel: "x:ingest" },
+    });
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+    expect(state.socketState).toBe("disconnected");
+  });
+
+  it("routes 'channelEvicted' with auth_expired: re-invokes JoinPrivateChannel and kicks the send loop; stays connected", async () => {
+    const state = createBeaconState();
+    let hub!: CountingHub;
+    let connectedCount = 0;
+    const loop = startSocketLoop({
+      build: () => (hub = new CountingHub()),
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      onConnected: () => {
+        connectedCount += 1;
+      },
+      sleep: yieldMacrotask,
+    });
+    await drain();
+    expect(state.socketState).toBe("connected");
+    expect(hub.joinCount).toBe(1);
+    expect(connectedCount).toBe(1);
+
+    hub.emit("ChannelEvent", {
+      channel: "x:ingest",
+      event: "channelEvicted",
+      data: { channel: "x:ingest", reason: "auth_expired" },
+    });
+    await drain();
+
+    // Re-joined on the same connection: JoinPrivateChannel invoked again,
+    // onConnected (the send-loop kick) fired again, state stayed connected
+    // throughout.
+    expect(hub.joinCount).toBe(2);
+    expect(connectedCount).toBe(2);
+    expect(state.socketState).toBe("connected");
+
+    await loop.stop();
+    expect(state.socketState).toBe("disconnected");
+  });
+
+  it("routes 'channelEvicted' with any other reason through the normal reconnect path", async () => {
     const state = createBeaconState();
     let hub!: FakeHubClient;
     const loop = startSocketLoop({
@@ -137,11 +224,55 @@ describe("socket loop transitions", () => {
     });
     await drain();
     expect(state.socketState).toBe("connected");
-    hub.emit("channelEvicted", { reason: "auth_expired" });
-    // Eviction triggers stopCurrent(); the outer loop loops back and the state
-    // becomes "connecting" for the next attempt.
+    hub.emit("ChannelEvent", {
+      channel: "x:ingest",
+      event: "channelEvicted",
+      data: { channel: "x:ingest", reason: "service_removed" },
+    });
+    // The eviction stopped the current connection; the outer loop reconnects.
     await drain();
     expect(["connecting", "connected", "reconnecting"]).toContain(state.socketState);
+    await loop.stop();
+    expect(state.socketState).toBe("disconnected");
+  });
+
+  it("ignores envelopes for channels this beacon did not join", async () => {
+    const state = createBeaconState();
+    let hub!: CountingHub;
+    let connectedCount = 0;
+    const loop = startSocketLoop({
+      build: () => (hub = new CountingHub()),
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      onConnected: () => {
+        connectedCount += 1;
+      },
+      sleep: yieldMacrotask,
+    });
+    await drain();
+    expect(state.socketState).toBe("connected");
+    expect(hub.joinCount).toBe(1);
+
+    // A joined ack for someone else's channel: ignored.
+    hub.emit("ChannelEvent", {
+      channel: "y:ingest",
+      event: "joined",
+      data: { channel: "y:ingest" },
+    });
+    // An eviction for someone else's channel: also ignored (no re-invoke, no
+    // reconnect).
+    hub.emit("ChannelEvent", {
+      channel: "y:ingest",
+      event: "channelEvicted",
+      data: { channel: "y:ingest", reason: "auth_expired" },
+    });
+    await drain();
+
+    expect(hub.joinCount).toBe(1);
+    expect(connectedCount).toBe(1);
+    expect(state.socketState).toBe("connected");
+
     await loop.stop();
     expect(state.socketState).toBe("disconnected");
   });
