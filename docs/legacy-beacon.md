@@ -108,7 +108,7 @@ Flat JSON secret per environment (platform.md 3.6), every key required unless ma
 | `LB_POLL_MS` | `1000` (250 to 60000) |
 | `LB_LOG_LEVEL` | `info` |
 | `LB_FORCE_LEADER` (optional) | local only, refused in prod |
-| `GATEWAY_REALTIME_TOKEN` | injected by the gateway; used only for `/internal/leader` |
+| `GATEWAY_REALTIME_TOKEN` | injected by the gateway; used only for `/internal/leader`. Required when `LB_FORCE_LEADER` is false (its only reader); a forced leader never polls that endpoint, so the token is optional in that mode |
 
 The app fails fast on a missing key, printing the key name and never the value.
 

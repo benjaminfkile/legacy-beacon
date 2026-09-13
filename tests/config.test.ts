@@ -52,6 +52,32 @@ describe("loadConfig", () => {
     expect(c.forceLeader).toBe(true);
   });
 
+  it("makes GATEWAY_REALTIME_TOKEN optional when LB_FORCE_LEADER=true", () => {
+    const env = { ...base, LB_FORCE_LEADER: "true" } as Record<string, string | undefined>;
+    delete env.GATEWAY_REALTIME_TOKEN;
+    const c = loadConfig(env);
+    expect(c.forceLeader).toBe(true);
+    expect(c.gatewayRealtimeToken).toBeNull();
+  });
+
+  it("requires GATEWAY_REALTIME_TOKEN when LB_FORCE_LEADER is not set", () => {
+    const env = { ...base } as Record<string, string | undefined>;
+    delete env.GATEWAY_REALTIME_TOKEN;
+    try {
+      loadConfig(env);
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).keys).toContain("GATEWAY_REALTIME_TOKEN");
+    }
+  });
+
+  it("requires GATEWAY_REALTIME_TOKEN when LB_FORCE_LEADER=false", () => {
+    const env = { ...base, LB_FORCE_LEADER: "false" } as Record<string, string | undefined>;
+    delete env.GATEWAY_REALTIME_TOKEN;
+    expect(() => loadConfig(env)).toThrowError(/GATEWAY_REALTIME_TOKEN/);
+  });
+
   it("rejects out-of-range LB_POLL_MS", () => {
     expect(() => loadConfig({ ...base, LB_POLL_MS: "100" })).toThrowError(/LB_POLL_MS/);
     expect(() => loadConfig({ ...base, LB_POLL_MS: "99999" })).toThrowError(/LB_POLL_MS/);

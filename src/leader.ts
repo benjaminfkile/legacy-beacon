@@ -5,7 +5,9 @@
 
 export interface LeaderOptions {
   gatewayInternalUrl: string;
-  realtimeToken: string;
+  // Null only when forceLeader is true — the forced path never polls
+  // /internal/leader and does not need the token.
+  realtimeToken: string | null;
   forceLeader?: boolean;
   pollMs?: number;
   timeoutMs?: number;
@@ -71,7 +73,7 @@ export function startLeader(opts: LeaderOptions): Leader {
       const res = await fetchImpl(`${opts.gatewayInternalUrl}/internal/leader`, {
         method: "GET",
         headers: {
-          "X-Gateway-Realtime-Token": opts.realtimeToken,
+          "X-Gateway-Realtime-Token": opts.realtimeToken ?? "",
           Accept: "application/json",
         },
         signal: controller.signal,
