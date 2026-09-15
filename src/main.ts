@@ -85,12 +85,21 @@ async function main(): Promise<void> {
           { err: err instanceof Error ? err.message : String(err) },
           "hub build failed; backing off",
         ),
+      log: {
+        info: (msg) => log.info(msg),
+        warn: (msg) => log.warn(msg),
+      },
     });
     sendLoop = startSendLoop({
       state,
       rest,
       getHub: () => hub,
       ingestChannel: config.ingestChannel,
+      onHubRejectionThreshold: () => {
+        // Contracts 9.2: three consecutive hub rejections while the socket
+        // stays connected ask the socket loop to re-join once.
+        void socket?.rejoin();
+      },
     });
     poller = createPoller({
       url: config.sourceUrl,
