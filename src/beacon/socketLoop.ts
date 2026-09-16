@@ -1,9 +1,11 @@
 // Socket loop per contracts 9.2. At most one connection; `connected` only after
 // the JoinPrivateChannel invoke resolves (the joined ack); evictions re-join
-// immediately (auth_expired) or force a reconnect (any other reason); a join
-// denied by the gateway makes the first retry wait 10 s; every other close or
-// failure takes the 1 s, 2 s, 3 s, 5 s backoff, and 5 s repeats forever. The
-// loop never gives up.
+// immediately (auth_expired) or force a reconnect (any other reason); any
+// transport-level close, error or clean, releases the client and reconnects
+// through the same backoff branch; a join denied by the gateway makes the first
+// retry wait 10 s; every other close or failure takes the 1 s, 2 s, 3 s, 5 s
+// backoff, and 5 s repeats forever. The loop terminates only when stop() is
+// called.
 //
 // The gateway carries every hub message inside the single client method
 // `ChannelEvent` (contracts 2.3 step 1). The envelope is routed on
@@ -117,6 +119,7 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
       let deniedNext = false;
       client.onClose(() => {
         if (state.socketState === "connected") state.socketState = "reconnecting";
+        if (current === client) void stopCurrent();
       });
       client.on(CHANNEL_EVENT, (envelope: unknown) => {
         if (current !== client) return;
@@ -148,10 +151,12 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
       try {
         await client.start();
         await client.invoke("JoinPrivateChannel", opts.ingestChannel, opts.key);
-        attempt = 0;
-        markConnected();
-        while (!stopped && current === client) {
-          await sleep(1000);
+        if (current === client) {
+          attempt = 0;
+          markConnected();
+          while (!stopped && current === client) {
+            await sleep(1000);
+          }
         }
       } catch (err) {
         deniedNext = isJoinDenied(err);
@@ -162,6 +167,7 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
       }
 
       if (stopped) return;
+      state.socketState = "reconnecting";
       opts.onDisconnected?.();
       let delay: number;
       if (deniedNext) {

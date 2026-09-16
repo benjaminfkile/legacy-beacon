@@ -304,6 +304,34 @@ describe("hub ChannelEvent envelope routing (contracts 2.3, 9.2)", () => {
     await loop.stop();
   });
 
+  it("re-invokes JoinPrivateChannel on the freshly built connection after a reconnect", async () => {
+    const state = createBeaconState();
+    const built: CountingHub[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new CountingHub();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await drain();
+    expect(built).toHaveLength(1);
+    expect(built[0]!.joinCount).toBe(1);
+
+    built[0]!.triggerClose(new Error("1006"));
+    await drain();
+
+    expect(built.length).toBeGreaterThanOrEqual(2);
+    const fresh = built[built.length - 1]!;
+    expect(fresh.joinCount).toBe(1);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+  });
+
   it("ignores envelopes for channels this beacon did not join", async () => {
     const state = createBeaconState();
     let hub!: CountingHub;
@@ -343,5 +371,284 @@ describe("hub ChannelEvent envelope routing (contracts 2.3, 9.2)", () => {
 
     await loop.stop();
     expect(state.socketState).toBe("disconnected");
+  });
+});
+
+describe("transport-level close: reconnect is unbounded and covers every close reason", () => {
+  // The scenario from the field: a gateway ASG instance refresh terminates the
+  // hub node, the beacon's WebSocket closes with 1006, and the beacon must
+  // rebuild and reconnect through the normal backoff branch. This is true for
+  // every close reason (error or clean), for as many closes as arrive, forever.
+
+  class CountingHub extends FakeHubClient {
+    public joinCount = 0;
+    override invoke<T = unknown>(method: string, ...args: unknown[]): Promise<T> {
+      if (method === "JoinPrivateChannel") {
+        this.joinCount += 1;
+        return Promise.resolve(undefined as unknown as T);
+      }
+      return super.invoke<T>(method, ...args);
+    }
+  }
+
+  async function waitConnected(state: ReturnType<typeof createBeaconState>): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (state.socketState === "connected") return;
+      await yieldMacrotask();
+    }
+    throw new Error(`timed out waiting for 'connected'; state=${state.socketState}`);
+  }
+
+  it("regression: a transport-level close must never leave the loop spinning on a dead client", async () => {
+    // Direct reproduction of the production symptom: WebSocket closes with
+    // status code 1006 (no reason given). With the loop's old inner
+    // `while (!stopped && current === client) sleep(1000)` gate and an onClose
+    // handler that only mutated `state.socketState`, `current` still pointed at
+    // the dead client after the close and the loop spun forever. The fix must
+    // release the dead client so the outer reconnect branch runs.
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await waitConnected(state);
+    expect(built).toHaveLength(1);
+
+    const dead = built[0]!;
+    dead.triggerClose(new Error("WebSocket closed with status code: 1006 (no reason given)."));
+    await waitConnected(state);
+
+    expect(built.length).toBeGreaterThan(1);
+    expect(built[built.length - 1]).not.toBe(dead);
+    await loop.stop();
+  });
+
+  it("onClose with an Error cause rebuilds the client and reconnects", async () => {
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await waitConnected(state);
+
+    built[0]!.triggerClose(new Error("Connection disconnected with error 'WebSocket closed with status code: 1006 (no reason given).'"));
+    await waitConnected(state);
+
+    expect(built.length).toBe(2);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+  });
+
+  it("onClose with a clean (undefined) cause rebuilds the client and reconnects", async () => {
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await waitConnected(state);
+
+    built[0]!.triggerClose();
+    await waitConnected(state);
+
+    expect(built.length).toBe(2);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+  });
+
+  it("25 consecutive transport-level closes produce 25 reconnects (no attempt cap, no give-up)", async () => {
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await waitConnected(state);
+    expect(state.reconnectCount).toBe(1);
+    expect(built.length).toBe(1);
+
+    for (let i = 0; i < 25; i++) {
+      built[built.length - 1]!.triggerClose(new Error("1006"));
+      await waitConnected(state);
+    }
+
+    expect(state.reconnectCount).toBe(26);
+    expect(built.length).toBe(26);
+    await loop.stop();
+  });
+
+  it("socketState goes connected -> reconnecting -> connected across a drop; reconnectCount +=1 per reconnect", async () => {
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const disconnects: number[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      onDisconnected: () => disconnects.push(1),
+      sleep: yieldMacrotask,
+    });
+    await waitConnected(state);
+    expect(state.socketState).toBe("connected");
+    expect(state.reconnectCount).toBe(1);
+
+    built[0]!.triggerClose(new Error("1006"));
+    expect(state.socketState).toBe("reconnecting");
+
+    await waitConnected(state);
+    expect(state.reconnectCount).toBe(2);
+    expect(disconnects.length).toBeGreaterThanOrEqual(1);
+
+    await loop.stop();
+  });
+
+  it("backoff follows 1s, 2s, 3s, 5s then stays 5s across many further reconnect attempts", async () => {
+    // Force every attempt to fail so `attempt` climbs monotonically instead of
+    // being reset by a successful connect, then read back the sleep sequence
+    // the loop asked for.
+    const state = createBeaconState();
+    const sleeps: number[] = [];
+    let loopHandle!: { stop(): Promise<void> };
+    loopHandle = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        h.startBehavior = "throw";
+        h.startError = new Error("connect failed");
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (sleeps.length >= 10) await loopHandle.stop();
+      },
+    });
+    await drain();
+    await drain();
+    expect(sleeps.slice(0, 10)).toEqual([
+      1000, 2000, 3000, 5000, 5000, 5000, 5000, 5000, 5000, 5000,
+    ]);
+  });
+
+  it("stop() terminates the loop promptly; no reconnect happens after stop()", async () => {
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    await waitConnected(state);
+    const buildsAtStop = built.length;
+
+    await loop.stop();
+    expect(state.socketState).toBe("disconnected");
+
+    // Late-arriving close events must not spawn a new client.
+    for (const h of built) h.triggerClose(new Error("late close"));
+    await drain();
+    await drain();
+    expect(built.length).toBe(buildsAtStop);
+    expect(state.socketState).toBe("disconnected");
+  });
+
+  it("a transport-level close arriving while a rejoin is in flight still reconnects", async () => {
+    // Contracts 9.2 audit: `channelEvicted auth_expired` fires an in-flight
+    // rejoin invoke; if the transport then dies underneath it, the loop must
+    // still drop the dead client and rebuild.
+    const state = createBeaconState();
+    let pendingRejoin: ((v?: unknown) => void) | null = null;
+    class HangingRejoinHub extends FakeHubClient {
+      public joinCount = 0;
+      override invoke<T = unknown>(method: string, ...args: unknown[]): Promise<T> {
+        if (method === "JoinPrivateChannel") {
+          this.joinCount += 1;
+          if (this.joinCount === 1) return Promise.resolve(undefined as unknown as T);
+          return new Promise<T>((_res, rej) => {
+            pendingRejoin = () => rej(new Error("connection lost"));
+          });
+        }
+        return super.invoke<T>(method, ...args);
+      }
+    }
+    const built: HangingRejoinHub[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new HangingRejoinHub();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    for (let i = 0; i < 200; i++) {
+      if (state.socketState === "connected") break;
+      await yieldMacrotask();
+    }
+    expect(state.socketState).toBe("connected");
+    expect(built[0]!.joinCount).toBe(1);
+
+    built[0]!.emit("ChannelEvent", {
+      channel: "x:ingest",
+      event: "channelEvicted",
+      data: { channel: "x:ingest", reason: "auth_expired" },
+    });
+    await drain();
+    expect(built[0]!.joinCount).toBe(2);
+    expect(state.rejoinCount).toBe(1);
+
+    built[0]!.triggerClose(new Error("1006"));
+    if (pendingRejoin) (pendingRejoin as () => void)();
+    for (let i = 0; i < 200; i++) {
+      if (state.socketState === "connected" && built.length >= 2) break;
+      await yieldMacrotask();
+    }
+    expect(built.length).toBeGreaterThanOrEqual(2);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
   });
 });
