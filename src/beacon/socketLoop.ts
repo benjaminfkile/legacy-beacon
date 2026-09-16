@@ -143,10 +143,23 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
       let deniedNext = false;
       let closeErr: unknown = null;
       let cycleErr: unknown = null;
+      let closed = false;
+      let signalClosed: () => void = () => {};
+      const closeSignal = new Promise<void>((resolve) => {
+        signalClosed = resolve;
+      });
+      const closeRejection: Promise<never> = closeSignal.then(() => {
+        throw new Error("hub connection closed");
+      });
+      // Swallow the rejection arm so a close that arrives after start/invoke
+      // have already settled never surfaces as an unhandled promise rejection.
+      closeRejection.catch(() => {});
       client.onClose((err) => {
         if (state.socketState === "connected") state.socketState = "reconnecting";
         if (current === client) {
           closeErr = err ?? null;
+          closed = true;
+          signalClosed();
           void stopCurrent();
         }
       });
@@ -182,13 +195,16 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
         }
       });
       try {
-        await client.start();
-        await client.invoke("JoinPrivateChannel", opts.ingestChannel, opts.key);
+        await Promise.race([client.start(), closeRejection]);
+        await Promise.race([
+          client.invoke("JoinPrivateChannel", opts.ingestChannel, opts.key),
+          closeRejection,
+        ]);
         if (current === client) {
           attempt = 0;
           markConnected();
-          while (!stopped && current === client) {
-            await sleep(1000);
+          while (!stopped && current === client && !closed) {
+            await Promise.race([sleep(1000), closeSignal]);
           }
         }
       } catch (err) {

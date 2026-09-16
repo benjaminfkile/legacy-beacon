@@ -847,3 +847,188 @@ describe("transport-level close: reconnect is unbounded and covers every close r
     await loop.stop();
   });
 });
+
+describe("connect handshake races the close signal", () => {
+  // The connect handshake and the connected spin loop each race against a
+  // per-iteration close signal fed from onClose. A transport-level close that
+  // arrives while start() or invoke() is still pending must abort the handshake
+  // and fall through to the normal reconnect branch immediately, not after the
+  // pending call's own timeout. The same signal breaks the connected spin
+  // loop's sleep so the loop exits the instant a close arrives.
+
+  async function waitConnected(state: ReturnType<typeof createBeaconState>): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (state.socketState === "connected") return;
+      await yieldMacrotask();
+    }
+    throw new Error(`timed out waiting for 'connected'; state=${state.socketState}`);
+  }
+
+  it("a close arriving while start() is still pending aborts the handshake and reconnects (no timeout wait)", async () => {
+    // The first hub hangs in start(); a close is fired while it's pending. The
+    // loop must abort start() via the close signal and rebuild.
+    class HangingStartHub extends FakeHubClient {
+      override async start(): Promise<void> {
+        this.started = true;
+        // Never resolve on its own; only the close signal will end the wait.
+        await new Promise<void>(() => {});
+      }
+    }
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    let buildCount = 0;
+    const loop = startSocketLoop({
+      build: () => {
+        buildCount += 1;
+        const h = buildCount === 1 ? new HangingStartHub() : new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    // Wait for the hanging first client to be built and its onClose registered.
+    for (let i = 0; i < 200; i++) {
+      if (built.length >= 1 && built[0]!.closeHandlers.length > 0) break;
+      await yieldMacrotask();
+    }
+    expect(built.length).toBe(1);
+    // Confirm start is stuck: state stays "connecting", not "connected".
+    expect(state.socketState).toBe("connecting");
+
+    built[0]!.triggerClose(new Error("1006"));
+    await waitConnected(state);
+
+    expect(built.length).toBeGreaterThanOrEqual(2);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+  });
+
+  it("a close arriving while the JoinPrivateChannel invoke is still pending aborts and reconnects (no timeout wait)", async () => {
+    // The first hub hangs in JoinPrivateChannel; a close is fired while the
+    // invoke is pending. The close-signal race makes the loop reconnect
+    // without waiting for the invoke to settle.
+    let hangingResolve: (() => void) | null = null;
+    class HangingJoinHub extends FakeHubClient {
+      override invoke<T = unknown>(method: string, ...args: unknown[]): Promise<T> {
+        if (method === "JoinPrivateChannel") {
+          return new Promise<T>((resolve) => {
+            hangingResolve = () => resolve(undefined as unknown as T);
+          });
+        }
+        return super.invoke<T>(method, ...args);
+      }
+    }
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    let buildCount = 0;
+    const loop = startSocketLoop({
+      build: () => {
+        buildCount += 1;
+        const h = buildCount === 1 ? new HangingJoinHub() : new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+    });
+    // Wait for the first hub's onClose handler to be attached (start() has
+    // resolved and we're now awaiting the pending invoke).
+    for (let i = 0; i < 200; i++) {
+      if (built.length >= 1 && built[0]!.closeHandlers.length > 0) break;
+      await yieldMacrotask();
+    }
+    expect(built.length).toBe(1);
+    expect(state.socketState).toBe("connecting");
+    // Give the loop a chance to reach the pending-invoke point.
+    for (let i = 0; i < 20; i++) await yieldMacrotask();
+
+    built[0]!.triggerClose(new Error("1006"));
+    await waitConnected(state);
+
+    // Never resolved the hanging invoke; the close-signal race did the work.
+    expect(hangingResolve).not.toBeNull();
+    expect(built.length).toBeGreaterThanOrEqual(2);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+  });
+
+  it("a close that arrives after start and invoke have already resolved still reconnects and produces no unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const state = createBeaconState();
+      const built: FakeHubClient[] = [];
+      const loop = startSocketLoop({
+        build: () => {
+          const h = new FakeHubClient();
+          built.push(h);
+          return h;
+        },
+        ingestChannel: "x:ingest",
+        key: "wbk_x",
+        state,
+        sleep: yieldMacrotask,
+      });
+      await waitConnected(state);
+      expect(built.length).toBe(1);
+
+      // start() and invoke() have long since resolved. Trigger a close and
+      // give the microtask queue several turns for any unhandled rejection to
+      // surface.
+      built[0]!.triggerClose(new Error("1006"));
+      await waitConnected(state);
+      for (let i = 0; i < 50; i++) await yieldMacrotask();
+
+      expect(built.length).toBeGreaterThanOrEqual(2);
+      expect(state.socketState).toBe("connected");
+      expect(unhandled).toEqual([]);
+      await loop.stop();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("the connected spin loop exits immediately on close rather than after the poll interval", async () => {
+    // The connected spin loop's sleep is raced against the close signal. A
+    // sleep that never resolves while state is "connected" proves the loop is
+    // not gated on the poll interval: the close signal alone must end the
+    // wait. The reconnect-branch sleep (state "reconnecting") is still allowed
+    // so the outer loop can rebuild.
+    const state = createBeaconState();
+    const built: FakeHubClient[] = [];
+    const sleep = (_ms: number): Promise<void> => {
+      if (state.socketState === "connected") {
+        return new Promise<void>(() => {});
+      }
+      return new Promise<void>((r) => setImmediate(r));
+    };
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep,
+    });
+    await waitConnected(state);
+    expect(built.length).toBe(1);
+
+    built[0]!.triggerClose(new Error("1006"));
+    await waitConnected(state);
+
+    expect(built.length).toBeGreaterThanOrEqual(2);
+    expect(state.socketState).toBe("connected");
+    await loop.stop();
+  });
+});
