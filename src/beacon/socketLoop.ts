@@ -23,8 +23,8 @@ import type { HubClient } from "./hub.js";
 import type { BeaconState } from "./state.js";
 
 export interface SocketLogger {
-  info: (msg: string) => void;
-  warn: (msg: string) => void;
+  info: (fields: Record<string, unknown>, msg: string) => void;
+  warn: (fields: Record<string, unknown>, msg: string) => void;
 }
 
 export interface SocketLoopOptions {
@@ -75,6 +75,14 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
     if (state.socketState === "connected") return;
     state.socketState = "connected";
     state.reconnectCount += 1;
+    opts.log?.info(
+      {
+        channel: opts.ingestChannel,
+        reconnectCount: state.reconnectCount,
+        attempt,
+      },
+      "socket connected",
+    );
     opts.onConnected?.();
   }
 
@@ -87,10 +95,16 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
     try {
       await client.invoke("JoinPrivateChannel", opts.ingestChannel, opts.key);
       if (current === client) opts.onConnected?.();
-      opts.log?.info("socket: rejoined");
+      opts.log?.info(
+        { channel: opts.ingestChannel, rejoinCount: state.rejoinCount },
+        "socket rejoined",
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      opts.log?.warn(`socket: rejoin failed ${msg}`);
+      opts.log?.warn(
+        { channel: opts.ingestChannel, err: msg },
+        "socket rejoin failed",
+      );
       if (current === client) {
         attempt = 0;
         state.socketState = "reconnecting";
@@ -111,15 +125,30 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
         state.socketState = "reconnecting";
         opts.onDisconnected?.();
         const delay = backoffMs(attempt);
+        const msg = err instanceof Error ? err.message : String(err);
+        opts.log?.info(
+          {
+            channel: opts.ingestChannel,
+            err: msg,
+            delayMs: delay,
+            attempt,
+          },
+          "socket closed; reconnecting",
+        );
         attempt += 1;
         if (delay > 0) await sleep(delay);
         continue;
       }
       current = client;
       let deniedNext = false;
-      client.onClose(() => {
+      let closeErr: unknown = null;
+      let cycleErr: unknown = null;
+      client.onClose((err) => {
         if (state.socketState === "connected") state.socketState = "reconnecting";
-        if (current === client) void stopCurrent();
+        if (current === client) {
+          closeErr = err ?? null;
+          void stopCurrent();
+        }
       });
       client.on(CHANNEL_EVENT, (envelope: unknown) => {
         if (current !== client) return;
@@ -139,11 +168,15 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
             env.data && typeof env.data === "object" && "reason" in (env.data as object)
               ? (env.data as { reason?: string }).reason
               : undefined;
-          opts.log?.info(`socket: evicted ${reason ?? "unknown"}`);
+          opts.log?.info(
+            { channel: opts.ingestChannel, reason: reason ?? "unknown" },
+            "socket evicted",
+          );
           if (reason === "auth_expired") {
             void tryRejoinOn(client);
             return;
           }
+          cycleErr = new Error(`evicted: ${reason ?? "unknown"}`);
           void stopCurrent();
           return;
         }
@@ -159,6 +192,7 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
           }
         }
       } catch (err) {
+        cycleErr = err;
         deniedNext = isJoinDenied(err);
         state.socketState = "reconnecting";
         opts.onDisconnected?.();
@@ -169,6 +203,7 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
       if (stopped) return;
       state.socketState = "reconnecting";
       opts.onDisconnected?.();
+      const attemptForLog = attempt;
       let delay: number;
       if (deniedNext) {
         delay = JOIN_DENIED_FIRST_WAIT_MS;
@@ -177,6 +212,22 @@ export function startSocketLoop(opts: SocketLoopOptions): SocketLoop {
         delay = backoffMs(attempt);
         attempt += 1;
       }
+      const reasonErr = cycleErr ?? closeErr;
+      const errMsg =
+        reasonErr instanceof Error
+          ? reasonErr.message
+          : reasonErr != null
+            ? String(reasonErr)
+            : null;
+      opts.log?.info(
+        {
+          channel: opts.ingestChannel,
+          err: errMsg,
+          delayMs: delay,
+          attempt: attemptForLog,
+        },
+        "socket closed; reconnecting",
+      );
       if (delay > 0) await sleep(delay);
     }
   }
