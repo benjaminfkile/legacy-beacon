@@ -374,6 +374,201 @@ describe("hub ChannelEvent envelope routing (contracts 2.3, 9.2)", () => {
   });
 });
 
+describe("socket state transitions log at INFO", () => {
+  interface LogLine {
+    level: "info" | "warn";
+    fields: Record<string, unknown>;
+    msg: string;
+  }
+  function makeLog(): { lines: LogLine[]; log: { info: (f: Record<string, unknown>, m: string) => void; warn: (f: Record<string, unknown>, m: string) => void } } {
+    const lines: LogLine[] = [];
+    return {
+      lines,
+      log: {
+        info: (fields, msg) => lines.push({ level: "info", fields, msg }),
+        warn: (fields, msg) => lines.push({ level: "warn", fields, msg }),
+      },
+    };
+  }
+
+  async function waitConnected(state: ReturnType<typeof createBeaconState>): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (state.socketState === "connected") return;
+      await yieldMacrotask();
+    }
+    throw new Error(`timed out waiting for 'connected'; state=${state.socketState}`);
+  }
+
+  it("logs a single INFO on connect with the channel and reconnectCount", async () => {
+    const state = createBeaconState();
+    const { lines, log } = makeLog();
+    const loop = startSocketLoop({
+      build: () => new FakeHubClient(),
+      ingestChannel: "x:ingest",
+      key: "wbk_secret_should_never_appear",
+      state,
+      sleep: yieldMacrotask,
+      log,
+    });
+    await waitConnected(state);
+    const connectLines = lines.filter((l) => l.msg === "socket connected");
+    expect(connectLines).toHaveLength(1);
+    expect(connectLines[0]!.level).toBe("info");
+    expect(connectLines[0]!.fields.channel).toBe("x:ingest");
+    expect(connectLines[0]!.fields.reconnectCount).toBe(1);
+    await loop.stop();
+  });
+
+  it("logs a single INFO on transport-level close including err and scheduled delayMs", async () => {
+    const state = createBeaconState();
+    const { lines, log } = makeLog();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_secret_should_never_appear",
+      state,
+      sleep: yieldMacrotask,
+      log,
+    });
+    await waitConnected(state);
+    lines.length = 0;
+    built[0]!.triggerClose(new Error("WebSocket closed with status code: 1006"));
+    await waitConnected(state);
+
+    const closeLines = lines.filter((l) => l.msg === "socket closed; reconnecting");
+    expect(closeLines.length).toBeGreaterThanOrEqual(1);
+    const first = closeLines[0]!;
+    expect(first.level).toBe("info");
+    expect(first.fields.channel).toBe("x:ingest");
+    expect(String(first.fields.err)).toMatch(/1006/);
+    expect(first.fields.delayMs).toBe(1000);
+    await loop.stop();
+  });
+
+  it("a reconnect logs 'socket connected' with an incremented reconnectCount so recovery is distinguishable from first connect", async () => {
+    const state = createBeaconState();
+    const { lines, log } = makeLog();
+    const built: FakeHubClient[] = [];
+    const loop = startSocketLoop({
+      build: () => {
+        const h = new FakeHubClient();
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: "wbk_secret_should_never_appear",
+      state,
+      sleep: yieldMacrotask,
+      log,
+    });
+    await waitConnected(state);
+    built[0]!.triggerClose(new Error("1006"));
+    await waitConnected(state);
+
+    const connectLines = lines.filter((l) => l.msg === "socket connected");
+    expect(connectLines).toHaveLength(2);
+    expect(connectLines[0]!.fields.reconnectCount).toBe(1);
+    expect(connectLines[1]!.fields.reconnectCount).toBe(2);
+    await loop.stop();
+  });
+
+  it("never logs the beacon key or any credential material", async () => {
+    const state = createBeaconState();
+    const { lines, log } = makeLog();
+    const secret = "wbk_TOP_SECRET_KEY_MUST_NOT_LEAK";
+    const built: FakeHubClient[] = [];
+    let buildCount = 0;
+    const loop = startSocketLoop({
+      build: () => {
+        buildCount += 1;
+        // First build is a denied join, so the denial code path fires; second
+        // build succeeds so the loop reaches "connected" and we can drop it.
+        const h = new FakeHubClient();
+        if (buildCount === 1) {
+          h.joinBehavior = "denied";
+          h.joinError = new Error("join denied by gateway");
+        }
+        built.push(h);
+        return h;
+      },
+      ingestChannel: "x:ingest",
+      key: secret,
+      state,
+      sleep: yieldMacrotask,
+      log,
+    });
+    await waitConnected(state);
+    // Force a drop and reconnect.
+    built[built.length - 1]!.triggerClose(new Error("1006"));
+    await waitConnected(state);
+    // Force an auth_expired eviction so tryRejoinOn fires.
+    built[built.length - 1]!.emit("ChannelEvent", {
+      channel: "x:ingest",
+      event: "channelEvicted",
+      data: { channel: "x:ingest", reason: "auth_expired" },
+    });
+    await drain();
+    await loop.rejoin();
+    await drain();
+
+    for (const line of lines) {
+      const serialized = JSON.stringify({ msg: line.msg, fields: line.fields });
+      expect(serialized).not.toContain(secret);
+    }
+    await loop.stop();
+  });
+
+  it("a steady connected beacon emits no repeated socket lines", async () => {
+    const state = createBeaconState();
+    const { lines, log } = makeLog();
+    const loop = startSocketLoop({
+      build: () => new FakeHubClient(),
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+      log,
+    });
+    await waitConnected(state);
+    const linesAfterConnect = [...lines];
+    // Let the loop idle: many macrotask turns while nothing changes.
+    for (let i = 0; i < 200; i++) await yieldMacrotask();
+    expect(lines).toEqual(linesAfterConnect);
+    await loop.stop();
+  });
+
+  it("a join denial logs the eviction/denial and carries the channel", async () => {
+    const state = createBeaconState();
+    const { lines, log } = makeLog();
+    let hub!: FakeHubClient;
+    const loop = startSocketLoop({
+      build: () => (hub = new FakeHubClient()),
+      ingestChannel: "x:ingest",
+      key: "wbk_x",
+      state,
+      sleep: yieldMacrotask,
+      log,
+    });
+    await waitConnected(state);
+    hub.emit("ChannelEvent", {
+      channel: "x:ingest",
+      event: "channelEvicted",
+      data: { channel: "x:ingest", reason: "service_removed" },
+    });
+    await drain();
+    const evictLines = lines.filter((l) => l.msg === "socket evicted");
+    expect(evictLines.length).toBeGreaterThanOrEqual(1);
+    expect(evictLines[0]!.fields.channel).toBe("x:ingest");
+    expect(evictLines[0]!.fields.reason).toBe("service_removed");
+    await loop.stop();
+  });
+});
+
 describe("transport-level close: reconnect is unbounded and covers every close reason", () => {
   // The scenario from the field: a gateway ASG instance refresh terminates the
   // hub node, the beacon's WebSocket closes with 1006, and the beacon must

@@ -86,8 +86,8 @@ async function main(): Promise<void> {
           "hub build failed; backing off",
         ),
       log: {
-        info: (msg) => log.info(msg),
-        warn: (msg) => log.warn(msg),
+        info: (fields, msg) => log.info(fields, msg),
+        warn: (fields, msg) => log.warn(fields, msg),
       },
     });
     sendLoop = startSendLoop({
