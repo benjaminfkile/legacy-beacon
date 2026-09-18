@@ -17,12 +17,13 @@ Every name, shape, path, and rule below is the one in the shared contracts (`doc
 
 ```
 legacy-beacon/
-  package.json  tsconfig.json  Dockerfile  .github/workflows/deploy.yml  .github/workflows/ci.yml
+  package.json  tsconfig.json  tsconfig.build.json  vitest.config.ts  Dockerfile  .github/workflows/deploy.yml  .github/workflows/ci.yml
   CONTRACTS_SHA  contracts/  scripts/check-contracts.mjs
   docs/legacy-beacon.md  docs/DESIGN.md  docs/contracts.md  docs/README.md
   src/
     main.ts                     boot: config, leader monitor, poller, beacon core, http
     config.ts                   the LB_* keys, validated (section 6)
+    heartbeat.ts                the heartbeat body: the health core and the debug object (section 5)
     beacon/                     the beacon core (contracts 9.2), byte-identical to simulator-beacon's src/beacon/
       socketLoop.ts  sendLoop.ts  heartbeatLoop.ts  backoff.ts  rest.ts  hub.ts  state.ts
     source/
