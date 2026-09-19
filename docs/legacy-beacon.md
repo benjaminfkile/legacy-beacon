@@ -10,7 +10,7 @@ Every name, shape, path, and rule below is the one in the shared contracts (`doc
 
 | Piece | Choice |
 |---|---|
-| Runtime | Node 22, TypeScript strict, ES modules, `@microsoft/signalr` (WebSockets only, negotiation skipped), native `fetch`, `pino` logging (JSON lines); no database, no HTTP surface but the health probe |
+| Runtime | Node 22, TypeScript strict, ES modules, `beacon-library` (the beacon core and the leader monitor), native `fetch`, `pino` logging (JSON lines); no database, no HTTP surface but the health probe |
 | Container | `node:22-alpine`, port 3000, `GET /api/health`; deployed exactly like the API (platform.md 3.6, 9.2a) |
 | Tests | Vitest for the normalizer, the poller, the send-loop decision table; a soak note like Red-Nose's |
 | Repository | `legacy-beacon`, branches `grunt`, `dev`, `main`; `contracts/` vendored with `CONTRACTS_SHA` and a contracts check (contracts 13) |
@@ -19,20 +19,21 @@ Every name, shape, path, and rule below is the one in the shared contracts (`doc
 legacy-beacon/
   package.json  tsconfig.json  tsconfig.build.json  vitest.config.ts  Dockerfile  .github/workflows/deploy.yml  .github/workflows/ci.yml
   CONTRACTS_SHA  contracts/  scripts/check-contracts.mjs
+  BEACON_LIBRARY_SHA  vendor/  scripts/check-beacon-library.mjs
   docs/legacy-beacon.md  docs/DESIGN.md  docs/contracts.md  docs/README.md
   src/
-    main.ts                     boot: config, leader monitor, poller, beacon core, http
+    main.ts                     boot: config, logger, hand off to service.ts
+    service.ts                  wires createBeacon and gateOnLeader from beacon-library to the poller and health
     config.ts                   the LB_* keys, validated (section 6)
     heartbeat.ts                the heartbeat body: the health core and the debug object (section 5)
-    beacon/                     the beacon core (contracts 9.2), byte-identical to simulator-beacon's src/beacon/
-      socketLoop.ts  sendLoop.ts  heartbeatLoop.ts  backoff.ts  rest.ts  hub.ts  state.ts
     source/
       poller.ts                 GET LB_SOURCE_URL every LB_POLL_MS, timeouts, statistics
       normalize.ts              the legacy payload to a LocationPayload (section 3)
-    leader.ts                   GET /internal/leader poll (contracts 7.5), 90 s expiry
     health.ts                   GET /api/health
   tests/
 ```
+
+The beacon core and the leader monitor come from the `beacon-library` package: its tarball ships in `vendor/`, `BEACON_LIBRARY_SHA` pins the library commit it was packed from, and `scripts/check-beacon-library.mjs` verifies the tarball, the recorded SHA-256, and the pinned commit id on every CI run (section 9).
 
 ---
 
@@ -74,7 +75,7 @@ Every poll that yields a usable position becomes the latest fix, whatever `mode`
 
 ## 4. The beacon core
 
-`src/beacon/` is the same code as the simulator beacon's (simulator-beacon.md 3): the socket loop (one connection, `JoinPrivateChannel` with the key, `connected` on the `joined` ack, evictions, the 1 s, 2 s, 3 s, 5 s backoff, never giving up), the send loop (one latest fix, one in-flight send, hub while connected else `POST /locations`, no fallback while the socket is up, `sendsFailedSinceBoot` only with a live event), the heartbeat loop (every 15 s over HTTP, `401` sets revoked), and the state. The two copies are kept identical by hand; a change lands in both repositories in the same wave.
+The core is the `beacon-library` package, vendored at the version in package.json: the socket loop (one connection, `JoinPrivateChannel` with the key, `connected` on the `joined` ack, evictions, the 1 s, 2 s, 3 s, 5 s backoff, never giving up), the send loop (one latest fix, one in-flight send, hub while connected else `POST /locations`, no fallback while the socket is up, `sendsFailedSinceBoot` only with a live event), the heartbeat loop (every 15 s over HTTP, `401` sets revoked), and the state. This repository keeps only what is particular to this beacon: the Heroku poller, the normalizer, the heartbeat health and debug builders, the leader-gated wiring in `src/service.ts`, and the health probe.
 
 ---
 
@@ -131,11 +132,14 @@ Manifest entry `legacy-beacon` (`-dev`), image `legacy-beacon:<sha>-<env>`, port
 
 | Suite | Covers |
 |---|---|
+| `config` | every `LB_*` key validated; missing keys named but not valued; `LB_FORCE_LEADER=true` refused in prod; `GATEWAY_REALTIME_TOKEN` optional under a forced leader |
 | `normalize` | the two samples; `lon` not `lng`; mph and feet conversions; `time` 0 becomes the poll time; unparseable speed and altitude become null; an out-of-range latitude is a failed poll; the output validates against the vendored `location.schema.json` |
 | `poller` | schedule holds under failures; timeout counted as failure; statistics; the raw payload lands in the state |
-| `beacon/*` | the same suites as the simulator's (they are the same files) |
-| `leader` | 90 s expiry, follower on any failure, force flag refused in prod |
+| `heartbeat` | `health.socketState` and `health.lastFixAgeS`, `batteryPercent` absent; the `debug` tree (source, normalized, transport, process); the whole body validates against the vendored `heartbeat.schema.json` |
+| `service.wiring` | the poller runs only while the node is leader, and a polled fix reaches the fake hub while the socket is connected |
 | Soak (dev) | 24 h enrolled as a spare against dev: heartbeat gap never over 60 s, `pollsFailed` small, no process restart; recorded under `docs/soak/<date>.md` |
+
+The beacon core's own suites (socket loop, send loop, heartbeat loop, hub, leader) live in the `beacon-library` repository and run there; this repository trusts the vendored library and does not re-test its behaviour.
 
 ---
 

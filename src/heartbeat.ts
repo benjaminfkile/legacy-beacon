@@ -5,9 +5,8 @@
 // the section 5 tree; it is stored verbatim by the API and rendered by the
 // panel as a themed JSON tree.
 
+import type { BeaconState, HealthCore } from "beacon-library";
 import type { Config } from "./config.js";
-import type { BeaconState } from "./beacon/state.js";
-import type { HealthCore } from "./beacon/rest.js";
 import { normalize } from "./source/normalize.js";
 import type { PollerStats } from "./source/poller.js";
 

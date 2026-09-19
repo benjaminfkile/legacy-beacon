@@ -20,6 +20,7 @@ Requires Node 22 or newer. `npm ci` installs dependencies.
 | `npm run dev` | Runs `src/main.ts` under `ts-node`; polls the real Heroku endpoint and posts into whatever `LB_API_BASE_URL` names (see below). |
 | `npm start` | Runs the built service from `dist/`. |
 | `npm run contracts:check` | Verifies `contracts/` matches `wmsfo-api` at the pinned `CONTRACTS_SHA`. |
+| `npm run beacon:check` | Verifies the vendored `beacon-library` tarball, its recorded SHA-256, and the pinned `BEACON_LIBRARY_SHA` still line up. |
 
 ## Local recipe (legacy-beacon.md §8)
 

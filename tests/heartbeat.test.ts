@@ -8,7 +8,7 @@ import { join } from "node:path";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { describe, expect, it } from "vitest";
-import { createBeaconState } from "../src/beacon/state.js";
+import { createBeaconState } from "beacon-library";
 import { buildHeartbeatDebug, buildHeartbeatHealth } from "../src/heartbeat.js";
 import type { Config } from "../src/config.js";
 import type { PollerStats } from "../src/source/poller.js";

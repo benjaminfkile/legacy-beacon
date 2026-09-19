@@ -6,8 +6,8 @@
 // counter and stamps `lastPollAt`. The raw payload is kept for the heartbeat's
 // debug object.
 
+import { setLatestFix, type BeaconState } from "beacon-library";
 import { normalize, type LegacyPayload } from "./normalize.js";
-import { setLatestFix, type BeaconState } from "../beacon/state.js";
 
 export interface PollerStats {
   lastPollAt: string | null;
