@@ -3,7 +3,7 @@
 // payload lands in the stats for the heartbeat's debug tree.
 
 import { describe, expect, it } from "vitest";
-import { createBeaconState } from "../src/beacon/state.js";
+import { createBeaconState } from "beacon-library";
 import { createPoller } from "../src/source/poller.js";
 
 const SAMPLE = {
