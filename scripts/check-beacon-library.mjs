@@ -2,7 +2,7 @@
 // Verify the vendored beacon-library tarball, its recorded SHA-256, the pinned
 // library commit id, and package.json's dependency line still line up. Makes
 // no network request: the tarball ships in vendor/, its SHA-256 in
-// vendor/beacon-library-1.0.0.tgz.sha256, and the library commit id in
+// vendor/beacon-library-1.1.0.tgz.sha256, and the library commit id in
 // BEACON_LIBRARY_SHA.
 
 import { createHash } from "node:crypto";
@@ -10,11 +10,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const TARBALL_REL = "vendor/beacon-library-1.0.0.tgz";
-const SHA_FILE_REL = "vendor/beacon-library-1.0.0.tgz.sha256";
+const TARBALL_REL = "vendor/beacon-library-1.1.0.tgz";
+const SHA_FILE_REL = "vendor/beacon-library-1.1.0.tgz.sha256";
 const COMMIT_FILE_REL = "BEACON_LIBRARY_SHA";
 const DEP_NAME = "beacon-library";
-const DEP_TARGET = "file:vendor/beacon-library-1.0.0.tgz";
+const DEP_TARGET = "file:vendor/beacon-library-1.1.0.tgz";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
