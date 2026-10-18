@@ -28,7 +28,7 @@ const CONFIG: Config = {
   hubUrl: "wss://gateway.example.com/hub",
   ingestChannel: "wmsfo-api-dev:ingest",
   gatewayInternalUrl: "http://172.17.0.1:8080",
-  sourceUrl: "https://santatracker-api.herokuapp.com/get?id=406santa",
+  sourceUrl: "https://legacy.example/get?id=406santa",
   pollMs: 1000,
   logLevel: "info",
   forceLeader: true,

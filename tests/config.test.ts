@@ -8,7 +8,7 @@ const base = {
   LB_HUB_URL: "wss://gateway.example.com/hub",
   LB_INGEST_CHANNEL: "wmsfo-api-dev:ingest",
   LB_GATEWAY_INTERNAL_URL: "http://172.17.0.1:8080",
-  LB_SOURCE_URL: "https://santatracker-api.herokuapp.com/get?id=406santa",
+  LB_SOURCE_URL: "https://legacy.example/get?id=406santa",
   LB_POLL_MS: "1000",
   LB_LOG_LEVEL: "info",
   GATEWAY_REALTIME_TOKEN: "grt_xxx",
