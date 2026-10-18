@@ -191,6 +191,8 @@ describe("heartbeat body shape (legacy-beacon.md 5, contracts 4.2)", () => {
     };
     const RUNNING: ModeControlStats = {
       enabled: true,
+      stateLoaded: true,
+      stateVersion: 3,
       owned: true,
       wanted: 1,
       polledMode: 0,

@@ -6,12 +6,36 @@
 // wanted one, one at a time, at least 5 s apart, with a 3 s timeout. The token
 // and the full request URL never reach a log line or the stats; the host and
 // the tracker id are the most that is logged.
+//
+// Ownership lives in the beacon's state document under `modeControl`. The
+// controller loads the document when it is created (this node became leader)
+// and does nothing until that load lands, retrying a failed load every 5 s.
+// It writes `modeControl` whenever `owned` changes or a mode request answers
+// 2xx, leaving every other top-level key as it is, and retries a failed write
+// on the next evaluate(). Each evaluate() also reloads the document when the
+// heartbeat's stateVersion is ahead of the copy held, and takes `owned` from it
+// unless a write of its own is still pending.
 
-import type { BeaconState } from "beacon-library";
+import { StateStoreError, type BeaconState, type StateStore } from "beacon-library";
 import type { PollerStats } from "./poller.js";
+
+export interface ModeControlDocument {
+  owned: boolean;
+  lastSetValue: 1 | 2 | null;
+  lastSetAt: string | null;
+}
+
+// The beacon's state document: `modeControl` is this beacon's; any other
+// top-level key is carried through writes untouched.
+export interface BeaconDocument {
+  modeControl?: ModeControlDocument;
+  [key: string]: unknown;
+}
 
 export interface ModeControlStats {
   enabled: true;
+  stateLoaded: boolean;
+  stateVersion: number | null;
   owned: boolean;
   wanted: 1 | 2 | null;
   polledMode: number | null;
@@ -32,6 +56,7 @@ export interface ModeControllerOptions {
   url: string;
   auth: string;
   state: BeaconState;
+  store: StateStore<BeaconDocument>;
   pollerStats: () => PollerStats | null;
   log: ModeControlLogger;
   fetchImpl?: typeof fetch;
@@ -47,6 +72,22 @@ export interface ModeController {
 export const MODE_FRESH_MS = 5000;
 export const MODE_SPACING_MS = 5000;
 export const MODE_TIMEOUT_MS = 3000;
+export const MODE_STATE_LOAD_RETRY_MS = 5000;
+
+function readDocument(doc: BeaconDocument): ModeControlDocument {
+  const m = doc.modeControl;
+  const lastSetValue = m?.lastSetValue === 1 || m?.lastSetValue === 2 ? m.lastSetValue : null;
+  return {
+    owned: m?.owned === true,
+    lastSetValue,
+    lastSetAt: typeof m?.lastSetAt === "string" ? m.lastSetAt : null,
+  };
+}
+
+function storeErrorFields(err: unknown): Record<string, unknown> {
+  if (err instanceof StateStoreError) return { code: err.code, status: err.status };
+  return { reason: err instanceof Error ? err.name : "unknown" };
+}
 
 export function createModeController(opts: ModeControllerOptions): ModeController {
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -54,12 +95,31 @@ export function createModeController(opts: ModeControllerOptions): ModeControlle
   const target = new URL(opts.url);
   const logTarget = { host: target.host, id: target.searchParams.get("id") };
 
+  const store = opts.store;
   let owned = false;
   let stopped = false;
   let inFlight: AbortController | null = null;
   let lastStartedMs: number | null = null;
+
+  // The document as this controller last read or wrote it.
+  let loaded = false;
+  let loadTimer: ReturnType<typeof setTimeout> | null = null;
+  let knownVersion: number | null = null;
+  let lastSet: Pick<ModeControlDocument, "lastSetValue" | "lastSetAt"> = {
+    lastSetValue: null,
+    lastSetAt: null,
+  };
+  // A change not yet written: `changes` counts them, `writtenChanges` is the
+  // count the last successful write carried.
+  let changes = 0;
+  let writtenChanges = 0;
+  let writing = false;
+  let refreshing = false;
+
   const stats: ModeControlStats = {
     enabled: true,
+    stateLoaded: false,
+    stateVersion: null,
     owned: false,
     wanted: null,
     polledMode: null,
@@ -70,6 +130,93 @@ export function createModeController(opts: ModeControllerOptions): ModeControlle
     setsOk: 0,
     setsFailed: 0,
   };
+
+  function adopt(doc: BeaconDocument, version: number): void {
+    const m = readDocument(doc);
+    owned = m.owned;
+    lastSet = { lastSetValue: m.lastSetValue, lastSetAt: m.lastSetAt };
+    knownVersion = version;
+    stats.owned = owned;
+    stats.stateVersion = version;
+  }
+
+  function load(): void {
+    loadTimer = null;
+    store.load().then(
+      (snap) => {
+        if (stopped) return;
+        adopt(snap.state, snap.version);
+        loaded = true;
+        stats.stateLoaded = true;
+      },
+      (err: unknown) => {
+        if (stopped) return;
+        opts.log.warn(
+          { ...storeErrorFields(err), retryMs: MODE_STATE_LOAD_RETRY_MS },
+          "mode state load failed",
+        );
+        loadTimer = setTimeout(load, MODE_STATE_LOAD_RETRY_MS);
+      },
+    );
+  }
+
+  function pending(): boolean {
+    return writtenChanges !== changes;
+  }
+
+  function markChanged(): void {
+    changes += 1;
+    write();
+  }
+
+  // Writes `modeControl` as it stands now; one write at a time.
+  function write(): void {
+    if (stopped || writing || !pending()) return;
+    writing = true;
+    let carried = changes;
+    store
+      .update((doc) => {
+        carried = changes;
+        doc.modeControl = { owned, ...lastSet };
+      })
+      .then(
+        (snap) => {
+          writtenChanges = carried;
+          knownVersion = snap.version;
+          stats.stateVersion = snap.version;
+        },
+        (err: unknown) => {
+          if (stopped) return;
+          opts.log.warn(storeErrorFields(err), "mode state write failed");
+        },
+      )
+      .finally(() => {
+        writing = false;
+      });
+  }
+
+  // Reloads the document when the heartbeat says it is ahead of the copy held.
+  function refresh(): void {
+    if (refreshing) return;
+    refreshing = true;
+    store
+      .refreshIfBehind(opts.state.lastHeartbeat?.stateVersion ?? null)
+      .then(() => {
+        if (stopped) return;
+        const cur = store.current();
+        if (!cur || cur.version === knownVersion) return;
+        if (pending() || writing) {
+          knownVersion = cur.version;
+          stats.stateVersion = cur.version;
+          return;
+        }
+        adopt(cur.state, cur.version);
+      })
+      .catch(() => {})
+      .finally(() => {
+        refreshing = false;
+      });
+  }
 
   function polledMode(): number | null {
     const p = opts.pollerStats();
@@ -138,6 +285,8 @@ export function createModeController(opts: ModeControllerOptions): ModeControlle
     if (reason === null) {
       stats.setsOk += 1;
       opts.log.info({ ...logTarget, from, to, status }, "legacy mode set");
+      lastSet = { lastSetValue: to, lastSetAt: new Date(startedMs).toISOString() };
+      if (!stopped) markChanged();
     } else {
       stats.setsFailed += 1;
       stats.lastSetError = reason;
@@ -146,12 +295,16 @@ export function createModeController(opts: ModeControllerOptions): ModeControlle
   }
 
   function evaluate(): void {
-    if (stopped) return;
+    if (stopped || !loaded) return;
+    write();
+    refresh();
     const wanted = wantedMode();
     const polled = polledMode();
+    const ownedBefore = owned;
     if (wanted === 1) owned = true;
     if (wanted === 2 && polled === 2) owned = false;
     stats.owned = owned;
+    if (owned !== ownedBefore) markChanged();
     stats.wanted = wanted;
     stats.polledMode = polled;
 
@@ -164,9 +317,12 @@ export function createModeController(opts: ModeControllerOptions): ModeControlle
 
   function stop(): void {
     stopped = true;
+    if (loadTimer) clearTimeout(loadTimer);
+    loadTimer = null;
     inFlight?.abort();
     inFlight = null;
   }
 
+  load();
   return { evaluate, stop, stats: () => ({ ...stats }) };
 }

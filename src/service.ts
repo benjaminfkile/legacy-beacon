@@ -4,12 +4,15 @@
 // with onStart bringing up the poller as the fix source and onStop tearing it
 // down. When mode control is configured, onStart also brings up the mode
 // controller after the poller, evaluated after every completed poll and on a
-// 1 s backstop interval, and onStop stops it before the poller. Extracted from
+// 1 s backstop interval, and onStop stops it before the poller. One state
+// store over the beacon's REST client lives as long as the service; each mode
+// controller loads ownership from it when created. Extracted from
 // main.ts so a test can drive the wiring with fakes.
 
 import type { Logger } from "pino";
 import {
   createBeacon,
+  createStateStore,
   gateOnLeader,
   type Beacon,
   type BeaconLogger,
@@ -20,7 +23,11 @@ import {
 import type { Config } from "./config.js";
 import { startHealthServer, type HealthProbe, type HealthServer } from "./health.js";
 import { buildHeartbeatDebug, buildHeartbeatHealth } from "./heartbeat.js";
-import { createModeController, type ModeController } from "./source/modeControl.js";
+import {
+  createModeController,
+  type BeaconDocument,
+  type ModeController,
+} from "./source/modeControl.js";
 import { createPoller, type Poller } from "./source/poller.js";
 
 const MODE_EVALUATE_MS = 1000;
@@ -94,6 +101,12 @@ export function startService(config: Config, deps: ServiceDeps): Service {
     ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
   });
 
+  const stateStore = createStateStore<BeaconDocument>({
+    rest: beacon.rest,
+    log: beaconLog,
+    empty: () => ({}),
+  });
+
   leader = gateOnLeader({
     leader: {
       gatewayInternalUrl: config.gatewayInternalUrl,
@@ -119,6 +132,7 @@ export function startService(config: Config, deps: ServiceDeps): Service {
           url: config.modeControl.url,
           auth: config.modeControl.auth,
           state: beacon.state,
+          store: stateStore,
           pollerStats: () => p.stats(),
           log: beaconLog,
           ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
