@@ -2,12 +2,13 @@
 // legacy-beacon.md section 5. `health.socketState` is the socket's state,
 // `health.lastFixAgeS` the age of the last successful poll (so a dead source
 // shows as "no recent fix" on the panel), `batteryPercent` absent. `debug` is
-// the section 5 tree; it is stored verbatim by the API and rendered by the
-// panel as a themed JSON tree.
+// the section 5 tree, including the mode controller's state; it is stored
+// verbatim by the API and rendered by the panel as a themed JSON tree.
 
 import type { BeaconState, HealthCore } from "beacon-library";
 import type { Config } from "./config.js";
 import { normalize } from "./source/normalize.js";
+import type { ModeControlStats } from "./source/modeControl.js";
 import type { PollerStats } from "./source/poller.js";
 
 export interface HeartbeatHealthInput {
@@ -37,8 +38,15 @@ export interface HeartbeatDebugInput {
   version: string;
   instance: string;
   leader: boolean;
+  // The running mode controller's stats; null when none runs on this node.
+  modeControlStats?: ModeControlStats | null;
   now?: () => number;
 }
+
+export type HeartbeatModeControl =
+  | ModeControlStats
+  | { enabled: true; owned: false; wanted: null }
+  | { enabled: false };
 
 export interface HeartbeatDebug {
   source: {
@@ -75,6 +83,7 @@ export interface HeartbeatDebug {
     version: string;
     node: string;
   };
+  modeControl: HeartbeatModeControl;
 }
 
 export function buildHeartbeatDebug(input: HeartbeatDebugInput): Record<string, unknown> {
@@ -86,6 +95,12 @@ export function buildHeartbeatDebug(input: HeartbeatDebugInput): Record<string, 
     ? normalize(lastPayload, { pollTimeMs: stats?.lastPollAtMs ?? now() })
     : null;
   const n = normalizedFix && normalizedFix.ok ? normalizedFix.fix : null;
+  // Off when not configured; configured but idle on a node that does not run
+  // the controller; otherwise the controller's own stats.
+  const modeControl: HeartbeatModeControl =
+    input.config.modeControl === null
+      ? { enabled: false }
+      : (input.modeControlStats ?? { enabled: true, owned: false, wanted: null });
   return {
     source: {
       url: input.config.sourceUrl,
@@ -121,5 +136,6 @@ export function buildHeartbeatDebug(input: HeartbeatDebugInput): Record<string, 
       version: input.version,
       node: process.version,
     },
+    modeControl,
   };
 }

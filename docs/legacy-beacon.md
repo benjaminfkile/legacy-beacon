@@ -1,6 +1,6 @@
 # Legacy beacon: technical design
 
-The legacy beacon is an ordinary enrolled beacon (contracts 9) whose fixes come from the legacy tracker: it polls `https://santatracker-api.herokuapp.com/get?id=406santa` once a second, normalizes whatever comes back into the location body of contracts 4.2, and posts it every second in every mode, over the hub with the HTTP fallback every beacon has. It heartbeats every 15 s with the raw legacy payload and its poll statistics as its `debug` object. It has no user interface; the admin panel's beacon page is its whole face. It runs on the fleet behind the gateway as a manifest service.
+The legacy beacon is an ordinary enrolled beacon (contracts 9) whose fixes come from the legacy tracker: it polls `https://santatracker-api.herokuapp.com/get?id=406santa` once a second, normalizes whatever comes back into the location body of contracts 4.2, and posts it every second in every mode, over the hub with the HTTP fallback every beacon has. It heartbeats every 15 s with the raw legacy payload and its poll statistics as its `debug` object. When mode control is configured, the leader also drives the legacy tracker's mode from its own heartbeat answer (section 3), so activating the beacon in the admin panel while an event is live is all an operator does. It has no user interface; the admin panel's beacon page is its whole face. It runs on the fleet behind the gateway as a manifest service.
 
 Every name, shape, path, and rule below is the one in the shared contracts (`docs/contracts.md`); the contract wins on any difference. Choices this document makes are in section 10; choices that need the owner are in section 11.
 
@@ -29,6 +29,7 @@ legacy-beacon/
     source/
       poller.ts                 GET LB_SOURCE_URL every LB_POLL_MS, timeouts, statistics
       normalize.ts              the legacy payload to a LocationPayload (section 3)
+      modeControl.ts            sets the legacy tracker's mode from the heartbeat answer (section 3)
     health.ts                   GET /api/health
   tests/
 ```
@@ -41,7 +42,7 @@ The beacon core and the leader monitor come from the `beacon-library` package: i
 
 1. Boots, verifies configuration, starts polling `GET /internal/leader` (every 2 s, 1 s timeout, leader only while the latest answer is `2xx`, `isLeader`, and `evaluatedAt` under 90 s old; `LB_FORCE_LEADER=true` for local runs, refused in prod).
 2. Every node serves `GET /api/health`.
-3. The leader runs the poller and the beacon core: every `LB_POLL_MS` (1000) it fetches the source, normalizes the answer, and hands the result to the send loop as the latest fix; the send loop posts it over the hub or HTTP like any beacon. A node that loses leadership stops its socket and poller within one poll; the new leader starts them. Two leaders for a loop during a hand-off post the same point twice, which the API stores as two rows; harmless.
+3. The leader runs the poller and the beacon core: every `LB_POLL_MS` (1000) it fetches the source, normalizes the answer, and hands the result to the send loop as the latest fix; the send loop posts it over the hub or HTTP like any beacon. When mode control is configured, the leader also runs the mode controller (section 3), evaluated after every completed poll and on a 1 s backstop; it starts after the poller and stops before it. A node that loses leadership stops its mode controller, socket, and poller within one poll; the new leader starts them, so a follower never sends a mode request. Two leaders for a loop during a hand-off post the same point twice, which the API stores as two rows; harmless.
 4. Heartbeats go every 15 s from the leader only; `health.socketState` is the socket's state, `health.lastFixAgeS` the age of the last successful poll (so a dead source shows as "no recent fix" on the panel), `health.batteryPercent` absent; `debug` is section 5.
 
 ---
@@ -69,7 +70,9 @@ The beacon core and the leader monitor come from the `beacon-library` package: i
 | `headingDeg` | `bearing_raw` | `Number()` when finite and within 0 to 360, else null (`bearing` "N" is never used) |
 | `accuracyM` | | always null; the legacy tracker reports none |
 
-Every poll that yields a usable position becomes the latest fix, whatever `mode` says and whether or not the point changed since the last poll; the API decides what to do with it (stored while an event is live, `409 no_live_event` otherwise, which the send loop treats as a failed send that never counts while the heartbeat says there is no live event). Nothing about the legacy `mode` is interpreted; it rides along in `debug.source.mode` for the panel to show.
+Every poll that yields a usable position becomes the latest fix, whatever `mode` says and whether or not the point changed since the last poll; the API decides what to do with it (stored while an event is live, `409 no_live_event` otherwise, which the send loop treats as a failed send that never counts while the heartbeat says there is no live event). The legacy `mode` never changes what is posted; it rides along in `debug.source.mode` for the panel to show, and, when mode control is configured, it is the polled mode the mode controller below confirms against.
+
+**Mode control** (`modeControl.ts`, only when `LB_MODE_URL` and `LB_MODE_AUTH` are set, only on the leader). The legacy tracker reports new positions only while its mode is RUN-SHOW. Its mode is set with a plain `GET` of `LB_MODE_URL` with `auth` (the token) and `value` (0 PRE-SHOW, 1 RUN-SHOW, 2 END-SHOW) appended as query parameters. The controller wants RUN-SHOW while this beacon is active, not revoked, and an event is live, per the latest heartbeat answer; it then owns the tracker (an in-memory flag, false at boot). It wants END-SHOW once when that stops after it owned the tracker, until the tracker reads END-SHOW and the ownership clears, or while the beacon is active with no live event and the tracker is in RUN-SHOW. Otherwise it hands off and sends nothing, so the tracker can still be set by hand. The polled mode is the `mode` of the last payload when it is a number and the last poll succeeded within 5 s; otherwise it is unknown and nothing is sent. A request goes out only when the polled mode is known and differs from the wanted one (END-SHOW only from RUN-SHOW: a tracker in PRE-SHOW is left alone), with at most one in flight, at least 5 s between request starts, a 3 s timeout, no body, and no credentials. A `2xx` counts as sent (`legacy mode set` at info, with `from`, `to`, and `status`); whether it took is confirmed only by the next polls. A non-2xx, a timeout, or a network error is logged at warn (`legacy mode set failed`, with a `reason`) and retried on the 5 s spacing, with no other backoff. No log line, error, or debug field carries the token or the full request URL; the host and the tracker `id` at most.
 
 ---
 
@@ -87,9 +90,13 @@ The core is the `beacon-library` package, vendored at the version in package.jso
               "consecutiveFailures": 0, "pollsOk": 3600, "pollsFailed": 2, "mode": 1, "lastPayload": { "...the raw legacy object..." } },
   "normalized": { "lat": 46.91852, "lng": -114.090039, "speedMps": 0, "altitudeM": 827.5, "headingDeg": 0, "recordedAt": "..." },
   "transport": { "socketState": "connected", "reconnectCount": 0, "httpFallbackSeconds": 0, "lastReceiptLatencyMs": 88, "sendsFailedSinceBoot": 0 },
-  "process": { "uptimeS": 3600, "leader": true, "instance": "i-...", "version": "0.1.0", "node": "v22.x" }
+  "process": { "uptimeS": 3600, "leader": true, "instance": "i-...", "version": "0.1.0", "node": "v22.x" },
+  "modeControl": { "enabled": true, "owned": true, "wanted": 1, "polledMode": 1, "lastSetAt": "...", "lastSetValue": 1, "lastSetStatus": 200,
+                   "lastSetError": null, "setsOk": 1, "setsFailed": 0 }
 }
 ```
+
+`modeControl` is the controller's state while it runs (times as ISO strings, unset values null), `{ "enabled": true, "owned": false, "wanted": null }` on a node with mode control configured that does not run it, and `{ "enabled": false }` when mode control is off.
 
 The panel renders it as a tree; nothing in it is read by anything.
 
@@ -110,15 +117,17 @@ Flat JSON secret per environment (platform.md 3.6), every key required unless ma
 | `LB_POLL_MS` | `1000` (250 to 60000) |
 | `LB_LOG_LEVEL` | `info` |
 | `LB_FORCE_LEADER` (optional) | local only, refused in prod |
+| `LB_MODE_URL` (optional) | `https://<legacy-tracker-host>/mode?id=<tracker id>`, the mode endpoint with its `id` and without `auth` or `value`; set together with `LB_MODE_AUTH` |
+| `LB_MODE_AUTH` (optional) | `<mode token>`, the legacy tracker's mode token; set together with `LB_MODE_URL` |
 | `GATEWAY_REALTIME_TOKEN` | injected by the gateway; used only for `/internal/leader`. Required when `LB_FORCE_LEADER` is false (its only reader); a forced leader never polls that endpoint, so the token is optional in that mode |
 
-The app fails fast on a missing key, printing the key name and never the value.
+The app fails fast on a missing key, printing the key name and never the value. `LB_MODE_URL` and `LB_MODE_AUTH` are set together or not at all: either alone, an `LB_MODE_URL` that does not parse, or one already carrying `auth` or `value` fails the same way. Both unset turns mode control off and the service behaves as without it. Only the environment whose beacon should drive the real tracker carries them; dev and prod would otherwise fight over the one tracker.
 
 ---
 
 ## 7. Deployment
 
-Manifest entry `legacy-beacon` (`-dev`), image `legacy-beacon:<sha>-<env>`, port 3000, secret per section 6, `includeInHealth` true, no realtime fields (platform.md 3.6). CI per platform.md 9.2a: `.github/workflows/deploy.yml` is the API's with the names changed (a `test` job that runs `npm ci`, the contracts check, `typecheck`, `test`, `build`; a `deploy` job needing it, gated on a push to `dev`, environment `dev` or `prod` by ref, OIDC-assumed AWS role, ECR login, QEMU and buildx, `docker buildx build --platform linux/arm64,linux/amd64 -t <ECR_REPOSITORY>:<sha>-<env> --push .`, the gateway client-credentials token, the deploy call, and a ten-minute wait for the gateway's `done` status). The gate widens to `main` once the prod manifest entry and secrets exist. First run per environment: mint the beacon in the panel, write the secret, upsert the manifest entry from the dashboard, deploy; activate the beacon when the legacy tracker should drive the site (the night of the flight if the phone is not the source, or never). Dev runs it enrolled against the dev API as a spare so its rows are stored but never published unless someone activates it.
+Manifest entry `legacy-beacon` (`-dev`), image `legacy-beacon:<sha>-<env>`, port 3000, secret per section 6, `includeInHealth` true, no realtime fields (platform.md 3.6). CI per platform.md 9.2a: `.github/workflows/deploy.yml` is the API's with the names changed (a `test` job that runs `npm ci`, the contracts check, `typecheck`, `test`, `build`; a `deploy` job needing it, gated on a push to `dev`, environment `dev` or `prod` by ref, OIDC-assumed AWS role, ECR login, QEMU and buildx, `docker buildx build --platform linux/arm64,linux/amd64 -t <ECR_REPOSITORY>:<sha>-<env> --push .`, the gateway client-credentials token, the deploy call, and a ten-minute wait for the gateway's `done` status). The gate widens to `main` once the prod manifest entry and secrets exist. First run per environment: mint the beacon in the panel, write the secret, upsert the manifest entry from the dashboard, deploy; activate the beacon when the legacy tracker should drive the site (the night of the flight if the phone is not the source, or never). Dev runs it enrolled against the dev API as a spare so its rows are stored but never published unless someone activates it. The mode secret (`LB_MODE_URL` and `LB_MODE_AUTH`) goes only into the secret of the environment whose beacon should drive the real tracker; dev and prod would otherwise fight over the one tracker.
 
 ---
 
@@ -132,11 +141,12 @@ Manifest entry `legacy-beacon` (`-dev`), image `legacy-beacon:<sha>-<env>`, port
 
 | Suite | Covers |
 |---|---|
-| `config` | every `LB_*` key validated; missing keys named but not valued; `LB_FORCE_LEADER=true` refused in prod; `GATEWAY_REALTIME_TOKEN` optional under a forced leader |
+| `config` | every `LB_*` key validated; missing keys named but not valued; `LB_FORCE_LEADER=true` refused in prod; `GATEWAY_REALTIME_TOKEN` optional under a forced leader; `LB_MODE_URL` and `LB_MODE_AUTH` both, neither, either alone, a bad URL, a URL already carrying `auth` or `value`, the token never printed |
+| `modeControl` | the mode decision table under fake timers and a fake fetch: RUN-SHOW while active and live, END-SHOW once after owning or while active with no live event, nothing when never active, revoked, in PRE-SHOW with END-SHOW wanted, or on an unknown or stale polled mode; one request in flight, 5 s spacing, 3 s timeout, retries; the request carries `id`, `auth`, and `value`; no log line carries the token |
 | `normalize` | the two samples; `lon` not `lng`; mph and feet conversions; `time` 0 becomes the poll time; unparseable speed and altitude become null; an out-of-range latitude is a failed poll; the output validates against the vendored `location.schema.json` |
 | `poller` | schedule holds under failures; timeout counted as failure; statistics; the raw payload lands in the state |
-| `heartbeat` | `health.socketState` and `health.lastFixAgeS`, `batteryPercent` absent; the `debug` tree (source, normalized, transport, process); the whole body validates against the vendored `heartbeat.schema.json` |
-| `service.wiring` | the poller runs only while the node is leader, and a polled fix reaches the fake hub while the socket is connected |
+| `heartbeat` | `health.socketState` and `health.lastFixAgeS`, `batteryPercent` absent; the `debug` tree (source, normalized, transport, process, modeControl in its three shapes); the whole body validates against the vendored `heartbeat.schema.json` |
+| `service.wiring` | the poller runs only while the node is leader, and a polled fix reaches the fake hub while the socket is connected; with mode control on, only the leader sends a mode request and an active, live state with the tracker in PRE-SHOW sends one RUN-SHOW; with it off no mode request is made |
 | Soak (dev) | 24 h enrolled as a spare against dev: heartbeat gap never over 60 s, `pollsFailed` small, no process restart; recorded under `docs/soak/<date>.md` |
 
 The beacon core's own suites (socket loop, send loop, heartbeat loop, hub, leader) live in the `beacon-library` repository and run there; this repository trusts the vendored library and does not re-test its behaviour.
@@ -146,7 +156,7 @@ The beacon core's own suites (socket loop, send loop, heartbeat loop, hub, leade
 ## 10. Decisions made here
 
 - The legacy beacon posts every second in every mode; the API's live-event rule decides what is stored. No point-change detection.
-- The legacy `mode` is never interpreted; it is shown in `debug`.
+- The beacon drives the legacy `mode` itself when mode control is configured: RUN-SHOW while this beacon is active and an event is live, END-SHOW once when that stops or while active with no live event and the tracker in RUN-SHOW, hands off otherwise. Activating the beacon in the panel is then the whole operator action, and the panel and the API stay unaware of the legacy tracker. The one gap: ownership lives in memory, so a restart after deactivation forgets it, and a tracker left in RUN-SHOW stays there until it is set by hand.
 - Units are converted at the edge: mph to metres per second, feet to metres, `bearing_raw` degrees as heading; accuracy is unknown and sent as null.
 - `time` 0 (pre-show) becomes the poll time so `recordedAt` is always a real instant.
 - Leader-gated like the simulator; no database.
