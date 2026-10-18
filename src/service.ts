@@ -2,7 +2,9 @@
 // createBeacon owns the socket loop, the send loop, the heartbeat loop, and the
 // REST client; gateOnLeader starts and stops that beacon as leadership changes,
 // with onStart bringing up the poller as the fix source and onStop tearing it
-// down. Extracted from main.ts so a test can drive the wiring with fakes.
+// down. When mode control is configured, onStart also brings up the mode
+// controller after the poller, evaluated after every completed poll and on a
+// 1 s backstop interval, and onStop stops it before the poller. Extracted from main.ts so a test can drive the wiring with fakes.
 
 import type { Logger } from "pino";
 import {
@@ -17,7 +19,10 @@ import {
 import type { Config } from "./config.js";
 import { startHealthServer, type HealthProbe, type HealthServer } from "./health.js";
 import { buildHeartbeatDebug, buildHeartbeatHealth } from "./heartbeat.js";
+import { createModeController, type ModeController } from "./source/modeControl.js";
 import { createPoller, type Poller } from "./source/poller.js";
+
+const MODE_EVALUATE_MS = 1000;
 
 export interface ServiceDeps {
   log: Logger;
@@ -47,6 +52,15 @@ export function startService(config: Config, deps: ServiceDeps): Service {
 
   let leader: Leader | null = null;
   let poller: Poller | null = null;
+  let modeController: ModeController | null = null;
+  let modeTimer: ReturnType<typeof setInterval> | null = null;
+
+  function stopModeControl(): void {
+    if (modeTimer) clearInterval(modeTimer);
+    modeTimer = null;
+    modeController?.stop();
+    modeController = null;
+  }
 
   const health = (deps.startHealth ?? startHealthServer)(
     () => ({
@@ -73,6 +87,7 @@ export function startService(config: Config, deps: ServiceDeps): Service {
         version: deps.version,
         instance: deps.instance,
         leader: leader?.isLeader() ?? false,
+        modeControlStats: modeController?.stats() ?? null,
       }),
     ...(deps.buildHub ? { buildHub: deps.buildHub } : {}),
     ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
@@ -93,11 +108,26 @@ export function startService(config: Config, deps: ServiceDeps): Service {
         pollMs: config.pollMs,
         state: beacon.state,
         onFix: () => beacon.wake(),
+        onPolled: () => modeController?.evaluate(),
         ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
       });
+      if (config.modeControl) {
+        stopModeControl();
+        const p = poller;
+        modeController = createModeController({
+          url: config.modeControl.url,
+          auth: config.modeControl.auth,
+          state: beacon.state,
+          pollerStats: () => p.stats(),
+          log: beaconLog,
+          ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+        });
+        modeTimer = setInterval(() => modeController?.evaluate(), MODE_EVALUATE_MS);
+      }
       poller.start();
     },
     onStop: () => {
+      stopModeControl();
       poller?.stop();
       poller = null;
     },
@@ -109,6 +139,7 @@ export function startService(config: Config, deps: ServiceDeps): Service {
     health: () => health,
     async stop() {
       leader?.stop();
+      stopModeControl();
       poller?.stop();
       poller = null;
       await beacon.stop();

@@ -1,6 +1,8 @@
 // The wiring in src/service.ts: gateOnLeader owns the poller through onStart
 // and onStop, so the poller runs only while this node is leader; a polled fix
-// reaches the fake hub while the socket is connected.
+// reaches the fake hub while the socket is connected. With mode control on,
+// the mode controller runs only while this node is leader; with it off no mode
+// request is ever made.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeHubClient, type HubClient, type HubOptions } from "beacon-library";
@@ -20,6 +22,7 @@ const CONFIG: Config = {
   logLevel: "silent",
   forceLeader: false,
   gatewayRealtimeToken: "grt_x",
+  modeControl: null,
 };
 
 const LEGACY_SAMPLE = {
@@ -39,10 +42,21 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+const MODE_CONFIG = {
+  url: "https://legacy.example/mode?id=tracker-1",
+  auth: "test-mode-auth",
+};
+
+function isModeRequest(u: string): boolean {
+  return u.startsWith("https://legacy.example/mode");
+}
+
 interface Scenario {
   hub: FakeHubClient;
   fetchCalls: string[];
   setLeader: (v: boolean) => void;
+  setSourceMode: (m: number) => void;
+  modeRequests: () => URL[];
   buildHub: (o: HubOptions) => HubClient;
   fetchImpl: typeof fetch;
 }
@@ -51,6 +65,7 @@ function makeScenario(): Scenario {
   const hub = new FakeHubClient();
   const fetchCalls: string[] = [];
   let leaderNow = false;
+  let sourceMode = LEGACY_SAMPLE.mode;
   const fetchImpl: typeof fetch = (async (input: Parameters<typeof fetch>[0]) => {
     const url =
       typeof input === "string"
@@ -63,7 +78,10 @@ function makeScenario(): Scenario {
       return jsonResponse({ isLeader: leaderNow, evaluatedAt: new Date().toISOString() });
     }
     if (url.startsWith(CONFIG.sourceUrl)) {
-      return jsonResponse(LEGACY_SAMPLE);
+      return jsonResponse({ ...LEGACY_SAMPLE, mode: sourceMode });
+    }
+    if (isModeRequest(url)) {
+      return new Response("ok", { status: 200 });
     }
     if (url.includes("/beacons/heartbeat")) {
       return jsonResponse({
@@ -89,6 +107,10 @@ function makeScenario(): Scenario {
     setLeader: (v) => {
       leaderNow = v;
     },
+    setSourceMode: (m) => {
+      sourceMode = m;
+    },
+    modeRequests: () => fetchCalls.filter(isModeRequest).map((u) => new URL(u)),
     buildHub: () => hub,
     fetchImpl,
   };
@@ -180,5 +202,83 @@ describe("service.ts wiring (L7)", () => {
     }
     await service.stop();
     throw new Error("hub never received SendToChannel");
+  });
+
+  async function settle(ms: number): Promise<void> {
+    await vi.advanceTimersByTimeAsync(ms);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  }
+
+  it("with mode control on, only the leader sends a mode request, and one active, live state with polled 0 sends value 1", async () => {
+    const s = makeScenario();
+    s.setSourceMode(0);
+    const service = startService(
+      { ...CONFIG, modeControl: MODE_CONFIG },
+      {
+        log,
+        version: "0.1.0",
+        bootMs: Date.now(),
+        instance: "test",
+        fetchImpl: s.fetchImpl,
+        buildHub: s.buildHub,
+        healthPort: 0,
+        startHealth: () => ({ port: () => 0, close: async () => {} }),
+      },
+    );
+    service.beacon().state.lastHeartbeat = {
+      receivedAt: new Date().toISOString(),
+      liveEventId: 1,
+      isActive: true,
+    };
+
+    // A follower makes no mode request, whatever the heartbeat state says.
+    await settle(6000);
+    expect(s.modeRequests()).toHaveLength(0);
+
+    // Leader: the first poll reads mode 0 and one request with value 1 goes out.
+    s.setLeader(true);
+    await settle(2100);
+    await settle(1000);
+    const sent = s.modeRequests();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.searchParams.get("value")).toBe("1");
+    expect(sent[0]!.searchParams.get("id")).toBe("tracker-1");
+    expect(sent[0]!.searchParams.get("auth")).toBe(MODE_CONFIG.auth);
+
+    // Follower again: the controller stops with the poller, so the tracker
+    // still reading 0 brings no further request.
+    s.setLeader(false);
+    await settle(2100);
+    const afterLoss = s.modeRequests().length;
+    await settle(12_000);
+    expect(s.modeRequests().length).toBe(afterLoss);
+    expect(afterLoss).toBeLessThanOrEqual(2);
+
+    await service.stop();
+  });
+
+  it("with mode control off no mode request is ever made", async () => {
+    const s = makeScenario();
+    s.setSourceMode(0);
+    const forced: Config = { ...CONFIG, forceLeader: true, gatewayRealtimeToken: null };
+    const service = startService(forced, {
+      log,
+      version: "0.1.0",
+      bootMs: Date.now(),
+      instance: "test",
+      fetchImpl: s.fetchImpl,
+      buildHub: s.buildHub,
+      healthPort: 0,
+      startHealth: () => ({ port: () => 0, close: async () => {} }),
+    });
+    service.beacon().state.lastHeartbeat = {
+      receivedAt: new Date().toISOString(),
+      liveEventId: 1,
+      isActive: true,
+    };
+    await settle(12_000);
+    expect(s.fetchCalls.some((u) => u.startsWith(CONFIG.sourceUrl))).toBe(true);
+    expect(s.modeRequests()).toHaveLength(0);
+    await service.stop();
   });
 });

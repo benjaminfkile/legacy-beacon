@@ -96,4 +96,66 @@ describe("loadConfig", () => {
       /LB_GATEWAY_INTERNAL_URL/,
     );
   });
+
+  describe("mode control", () => {
+    const MODE_URL = "https://legacy.example/mode?id=tracker-1";
+    const TOKEN = "test-mode-auth";
+
+    function expectModeError(env: Record<string, string | undefined>, key: string): void {
+      try {
+        loadConfig(env);
+        throw new Error("expected throw");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConfigError);
+        const ce = err as ConfigError;
+        expect(ce.keys).toEqual([key]);
+        expect(ce.message).toContain(key);
+        expect(ce.message).not.toContain(TOKEN);
+        expect(ce.message).not.toContain("legacy.example");
+        expect(String(ce.stack)).not.toContain(TOKEN);
+      }
+    }
+
+    it("is off when neither key is set", () => {
+      expect(loadConfig({ ...base }).modeControl).toBeNull();
+    });
+
+    it("is on when both keys are set", () => {
+      const c = loadConfig({ ...base, LB_MODE_URL: MODE_URL, LB_MODE_AUTH: TOKEN });
+      expect(c.modeControl).toEqual({ url: MODE_URL, auth: TOKEN });
+    });
+
+    it("accepts an http mode URL", () => {
+      const url = "http://legacy.example/mode?id=tracker-1";
+      const c = loadConfig({ ...base, LB_MODE_URL: url, LB_MODE_AUTH: TOKEN });
+      expect(c.modeControl?.url).toBe(url);
+    });
+
+    it("refuses LB_MODE_URL alone", () => {
+      expectModeError({ ...base, LB_MODE_URL: MODE_URL }, "LB_MODE_AUTH");
+    });
+
+    it("refuses LB_MODE_AUTH alone", () => {
+      expectModeError({ ...base, LB_MODE_AUTH: TOKEN }, "LB_MODE_URL");
+    });
+
+    it("refuses a mode URL that does not parse or is not http", () => {
+      expectModeError({ ...base, LB_MODE_URL: "not a url", LB_MODE_AUTH: TOKEN }, "LB_MODE_URL");
+      expectModeError(
+        { ...base, LB_MODE_URL: "ftp://legacy.example/mode?id=tracker-1", LB_MODE_AUTH: TOKEN },
+        "LB_MODE_URL",
+      );
+    });
+
+    it("refuses a mode URL already carrying auth or value", () => {
+      expectModeError(
+        { ...base, LB_MODE_URL: `${MODE_URL}&auth=${TOKEN}`, LB_MODE_AUTH: TOKEN },
+        "LB_MODE_URL",
+      );
+      expectModeError(
+        { ...base, LB_MODE_URL: `${MODE_URL}&value=1`, LB_MODE_AUTH: TOKEN },
+        "LB_MODE_URL",
+      );
+    });
+  });
 });

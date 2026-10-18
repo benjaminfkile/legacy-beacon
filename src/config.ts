@@ -15,6 +15,9 @@ export interface Config {
   // Required only when forceLeader is false — a forced leader never polls
   // /internal/leader, and the local recipe runs without a gateway.
   gatewayRealtimeToken: string | null;
+  // The legacy tracker's mode endpoint and its token; null when mode control
+  // is off (neither LB_MODE_URL nor LB_MODE_AUTH set).
+  modeControl: { url: string; auth: string } | null;
 }
 
 export class ConfigError extends Error {
@@ -106,6 +109,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!forceLeader && !isNonEmpty(env.GATEWAY_REALTIME_TOKEN))
     bad.push("GATEWAY_REALTIME_TOKEN");
 
+  // LB_MODE_URL and LB_MODE_AUTH are optional and set together. The URL is the
+  // mode endpoint with its id parameter; auth and value are appended per
+  // request, so a URL that already carries either is refused.
+  let modeControl: Config["modeControl"] = null;
+  const hasModeUrl = isNonEmpty(env.LB_MODE_URL);
+  const hasModeAuth = isNonEmpty(env.LB_MODE_AUTH);
+  if (hasModeUrl !== hasModeAuth) {
+    bad.push(hasModeUrl ? "LB_MODE_AUTH" : "LB_MODE_URL");
+  } else if (hasModeUrl && hasModeAuth) {
+    const u = parseHttpUrl(env.LB_MODE_URL!, bad, "LB_MODE_URL", ["http:", "https:"]);
+    if (u && (u.searchParams.has("auth") || u.searchParams.has("value"))) {
+      bad.push("LB_MODE_URL");
+    } else if (u) {
+      modeControl = { url: env.LB_MODE_URL!, auth: env.LB_MODE_AUTH! };
+    }
+  }
+
   const uniqueBad = Array.from(new Set(bad));
   if (uniqueBad.length > 0) {
     throw new ConfigError(
@@ -128,5 +148,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     gatewayRealtimeToken: isNonEmpty(env.GATEWAY_REALTIME_TOKEN)
       ? env.GATEWAY_REALTIME_TOKEN
       : null,
+    modeControl,
   };
 }

@@ -37,6 +37,8 @@ LB_SOURCE_URL=https://santatracker-api.herokuapp.com/get?id=406santa
 LB_POLL_MS=1000
 LB_LOG_LEVEL=info
 LB_FORCE_LEADER=true
+# LB_MODE_URL=https://<legacy-tracker-host>/mode?id=<tracker id>
+# LB_MODE_AUTH=<mode token>
 ```
 
 `LB_GATEWAY_INTERNAL_URL=http://localhost:1` and `LB_FORCE_LEADER=true` let the service run without a gateway: the forced leader never polls `/internal/leader`, so `GATEWAY_REALTIME_TOKEN` is not required in this mode (it is required in every other run — see legacy-beacon.md §6). `LB_FORCE_LEADER=true` is refused when `LB_ENV=prod`.

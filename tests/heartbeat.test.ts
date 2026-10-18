@@ -1,6 +1,6 @@
 // The heartbeat body shape: `health` carries socketState and lastFixAgeS from
 // the last successful poll (batteryPercent absent); `debug` is the section 5
-// tree (source, normalized, transport, process). The whole body must also
+// tree (source, normalized, transport, process, modeControl). The whole body must also
 // validate against the vendored heartbeat.schema.json.
 
 import { readFileSync } from "node:fs";
@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { createBeaconState } from "beacon-library";
 import { buildHeartbeatDebug, buildHeartbeatHealth } from "../src/heartbeat.js";
 import type { Config } from "../src/config.js";
+import type { ModeControlStats } from "../src/source/modeControl.js";
 import type { PollerStats } from "../src/source/poller.js";
 
 const schema = JSON.parse(
@@ -32,6 +33,7 @@ const CONFIG: Config = {
   logLevel: "info",
   forceLeader: true,
   gatewayRealtimeToken: "grt_x",
+  modeControl: null,
 };
 
 const RAW_PAYLOAD = {
@@ -102,9 +104,9 @@ describe("heartbeat body shape (legacy-beacon.md 5, contracts 4.2)", () => {
       leader: true,
       now,
     });
-    // The four top-level branches.
+    // The five top-level branches.
     expect(Object.keys(debug).sort()).toEqual(
-      ["normalized", "process", "source", "transport"].sort(),
+      ["modeControl", "normalized", "process", "source", "transport"].sort(),
     );
 
     const source = debug.source as Record<string, unknown>;
@@ -180,5 +182,71 @@ describe("heartbeat body shape (legacy-beacon.md 5, contracts 4.2)", () => {
     const ok = validate(body);
     if (!ok) console.error(validate.errors);
     expect(ok).toBe(true);
+  });
+
+  describe("modeControl", () => {
+    const MODE_CONFIG: Config = {
+      ...CONFIG,
+      modeControl: { url: "https://legacy.example/mode?id=tracker-1", auth: "test-mode-auth" },
+    };
+    const RUNNING: ModeControlStats = {
+      enabled: true,
+      owned: true,
+      wanted: 1,
+      polledMode: 0,
+      lastSetAt: "2026-12-22T01:31:07.000Z",
+      lastSetValue: 1,
+      lastSetStatus: 200,
+      lastSetError: null,
+      setsOk: 1,
+      setsFailed: 0,
+    };
+
+    function debugFor(config: Config, modeControlStats: ModeControlStats | null) {
+      return buildHeartbeatDebug({
+        state: createBeaconState(),
+        config,
+        pollerStats: stats(),
+        bootMs: Date.now() - 60_000,
+        version: "0.1.0",
+        instance: "i-x",
+        leader: modeControlStats !== null,
+        modeControlStats,
+      });
+    }
+
+    it("is the controller's stats while one runs", () => {
+      expect(debugFor(MODE_CONFIG, RUNNING).modeControl).toEqual(RUNNING);
+    });
+
+    it("is enabled and idle when configured but not running", () => {
+      expect(debugFor(MODE_CONFIG, null).modeControl).toEqual({
+        enabled: true,
+        owned: false,
+        wanted: null,
+      });
+    });
+
+    it("is disabled when mode control is off", () => {
+      expect(debugFor(CONFIG, null).modeControl).toEqual({ enabled: false });
+    });
+
+    it("every shape validates in the heartbeat body and never carries the token", () => {
+      for (const debug of [
+        debugFor(MODE_CONFIG, RUNNING),
+        debugFor(MODE_CONFIG, null),
+        debugFor(CONFIG, null),
+      ]) {
+        const body = {
+          sentAt: "2026-12-22T01:31:07.000Z",
+          health: buildHeartbeatHealth({ state: createBeaconState(), pollerStats: stats() }),
+          debug,
+        };
+        const ok = validate(body);
+        if (!ok) console.error(validate.errors);
+        expect(ok).toBe(true);
+        expect(JSON.stringify(body)).not.toContain("test-mode-auth");
+      }
+    });
   });
 });

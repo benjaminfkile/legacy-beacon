@@ -32,6 +32,9 @@ export interface PollerOptions {
   now?: () => number;
   onFix?: (seqLocal: number) => void;
   onError?: (reason: string) => void;
+  // Called after every completed poll, successful or not, once the stats are
+  // updated.
+  onPolled?: () => void;
 }
 
 export interface Poller {
@@ -159,6 +162,7 @@ export function createPoller(opts: PollerOptions): Poller {
     } finally {
       clearTimeout(to);
       inFlight = false;
+      opts.onPolled?.();
     }
   }
 
