@@ -4,7 +4,8 @@
 // with onStart bringing up the poller as the fix source and onStop tearing it
 // down. When mode control is configured, onStart also brings up the mode
 // controller after the poller, evaluated after every completed poll and on a
-// 1 s backstop interval, and onStop stops it before the poller. Extracted from main.ts so a test can drive the wiring with fakes.
+// 1 s backstop interval, and onStop stops it before the poller. Extracted from
+// main.ts so a test can drive the wiring with fakes.
 
 import type { Logger } from "pino";
 import {

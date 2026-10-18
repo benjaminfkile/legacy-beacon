@@ -1,6 +1,6 @@
 # Legacy beacon: technical design
 
-The legacy beacon is an ordinary enrolled beacon (contracts 9) whose fixes come from the legacy tracker: it polls `https://santatracker-api.herokuapp.com/get?id=406santa` once a second, normalizes whatever comes back into the location body of contracts 4.2, and posts it every second in every mode, over the hub with the HTTP fallback every beacon has. It heartbeats every 15 s with the raw legacy payload and its poll statistics as its `debug` object. When mode control is configured, the leader also drives the legacy tracker's mode from its own heartbeat answer (section 3), so activating the beacon in the admin panel while an event is live is all an operator does. It has no user interface; the admin panel's beacon page is its whole face. It runs on the fleet behind the gateway as a manifest service.
+The legacy beacon is an ordinary enrolled beacon (contracts 9) whose fixes come from the legacy tracker: it polls `https://<legacy-tracker-host>/get?id=<tracker id>` once a second, normalizes whatever comes back into the location body of contracts 4.2, and posts it every second in every mode, over the hub with the HTTP fallback every beacon has. It heartbeats every 15 s with the raw legacy payload and its poll statistics as its `debug` object. When mode control is configured, the leader also drives the legacy tracker's mode from its own heartbeat answer (section 3), so activating the beacon in the admin panel while an event is live is all an operator does. It has no user interface; the admin panel's beacon page is its whole face. It runs on the fleet behind the gateway as a manifest service.
 
 Every name, shape, path, and rule below is the one in the shared contracts (`docs/contracts.md`); the contract wins on any difference. Choices this document makes are in section 10; choices that need the owner are in section 11.
 
@@ -86,7 +86,7 @@ The core is the `beacon-library` package, vendored at the version in package.jso
 
 ```json
 {
-  "source": { "url": "https://santatracker-api.herokuapp.com/get?id=406santa", "pollMs": 1000, "lastPollAt": "...", "lastStatus": 200, "lastLatencyMs": 143,
+  "source": { "url": "https://<legacy-tracker-host>/get?id=<tracker id>", "pollMs": 1000, "lastPollAt": "...", "lastStatus": 200, "lastLatencyMs": 143,
               "consecutiveFailures": 0, "pollsOk": 3600, "pollsFailed": 2, "mode": 1, "lastPayload": { "...the raw legacy object..." } },
   "normalized": { "lat": 46.91852, "lng": -114.090039, "speedMps": 0, "altitudeM": 827.5, "headingDeg": 0, "recordedAt": "..." },
   "transport": { "socketState": "connected", "reconnectCount": 0, "httpFallbackSeconds": 0, "lastReceiptLatencyMs": 88, "sendsFailedSinceBoot": 0 },
@@ -113,7 +113,7 @@ Flat JSON secret per environment (platform.md 3.6), every key required unless ma
 | `LB_BEACON_KEY` | the `wbk_` key of the beacon named `legacy-tracker`, minted in the panel |
 | `LB_HUB_URL`, `LB_INGEST_CHANNEL` | `wss://<gateway-domain>/hub`, `<service>:ingest` (verified against `GET /beacons/me` at boot; a mismatch is logged) |
 | `LB_GATEWAY_INTERNAL_URL` | `http://<docker-bridge-ip>:8080` |
-| `LB_SOURCE_URL` | `https://santatracker-api.herokuapp.com/get?id=406santa` |
+| `LB_SOURCE_URL` | `https://<legacy-tracker-host>/get?id=<tracker id>` |
 | `LB_POLL_MS` | `1000` (250 to 60000) |
 | `LB_LOG_LEVEL` | `info` |
 | `LB_FORCE_LEADER` (optional) | local only, refused in prod |

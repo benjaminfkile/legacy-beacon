@@ -115,7 +115,7 @@ describe("normalize (legacy-beacon.md 3)", () => {
     if (!r1.ok) throw new Error("expected ok");
     expect(r1.fix.headingDeg).toBeNull();
 
-    // Without bearing_raw, no heading — even though `bearing` is present.
+    // Without bearing_raw, no heading, even though `bearing` is present.
     const without = { ...SAMPLE } as Record<string, unknown>;
     delete without.bearing_raw;
     const r2 = normalize(without, { pollTimeMs: POLL_MS });

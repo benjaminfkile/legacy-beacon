@@ -12,7 +12,7 @@ export interface Config {
   pollMs: number;
   logLevel: string;
   forceLeader: boolean;
-  // Required only when forceLeader is false — a forced leader never polls
+  // Required only when forceLeader is false: a forced leader never polls
   // /internal/leader, and the local recipe runs without a gateway.
   gatewayRealtimeToken: string | null;
   // The legacy tracker's mode endpoint and its token; null when mode control
