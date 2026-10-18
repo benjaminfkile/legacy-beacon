@@ -43,6 +43,8 @@ LB_FORCE_LEADER=true
 
 `LB_GATEWAY_INTERNAL_URL=http://localhost:1` and `LB_FORCE_LEADER=true` let the service run without a gateway: the forced leader never polls `/internal/leader`, so `GATEWAY_REALTIME_TOKEN` is not required in this mode (it is required in every other run; see legacy-beacon.md §6). `LB_FORCE_LEADER=true` is refused when `LB_ENV=prod`.
 
+Mode control keeps its ownership in the beacon's state document on the API (legacy-beacon.md §3); there is nothing new to configure.
+
 Load the file and run the dev command:
 
 ```

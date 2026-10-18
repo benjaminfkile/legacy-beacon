@@ -1,8 +1,8 @@
 // The wiring in src/service.ts: gateOnLeader owns the poller through onStart
 // and onStop, so the poller runs only while this node is leader; a polled fix
 // reaches the fake hub while the socket is connected. With mode control on,
-// the mode controller runs only while this node is leader; with it off no mode
-// request is ever made.
+// the mode controller runs only while this node is leader, reading the state
+// document before its first request; with it off no mode request is ever made.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeHubClient, type HubClient, type HubOptions } from "beacon-library";
@@ -66,7 +66,12 @@ function makeScenario(): Scenario {
   const fetchCalls: string[] = [];
   let leaderNow = false;
   let sourceMode = LEGACY_SAMPLE.mode;
-  const fetchImpl: typeof fetch = (async (input: Parameters<typeof fetch>[0]) => {
+  let stateDoc: Record<string, unknown> | null = null;
+  let stateVersion = 0;
+  const fetchImpl: typeof fetch = (async (
+    input: Parameters<typeof fetch>[0],
+    init?: RequestInit,
+  ) => {
     const url =
       typeof input === "string"
         ? input
@@ -82,6 +87,25 @@ function makeScenario(): Scenario {
     }
     if (isModeRequest(url)) {
       return new Response("ok", { status: 200 });
+    }
+    if (url.endsWith("/beacons/me/state")) {
+      const method = init?.method ?? "GET";
+      if (method === "PUT") {
+        const body = JSON.parse(String(init?.body)) as { state: Record<string, unknown> };
+        stateDoc = body.state;
+        stateVersion += 1;
+        return jsonResponse({
+          stateVersion,
+          updatedAt: new Date().toISOString(),
+          serverTime: new Date().toISOString(),
+        });
+      }
+      return jsonResponse({
+        state: stateDoc,
+        stateVersion,
+        updatedAt: null,
+        serverTime: new Date().toISOString(),
+      });
     }
     if (url.includes("/beacons/heartbeat")) {
       return jsonResponse({
@@ -229,6 +253,7 @@ describe("service.ts wiring (L7)", () => {
       receivedAt: new Date().toISOString(),
       liveEventId: 1,
       isActive: true,
+      stateVersion: null,
     };
 
     // A follower makes no mode request, whatever the heartbeat state says.
@@ -244,6 +269,12 @@ describe("service.ts wiring (L7)", () => {
     expect(sent[0]!.searchParams.get("value")).toBe("1");
     expect(sent[0]!.searchParams.get("id")).toBe("tracker-1");
     expect(sent[0]!.searchParams.get("auth")).toBe(MODE_CONFIG.auth);
+    // The controller read the state document first and wrote ownership to it.
+    const stateCalls = s.fetchCalls.filter((u) => u.endsWith("/beacons/me/state"));
+    expect(stateCalls.length).toBeGreaterThanOrEqual(2);
+    expect(s.fetchCalls.indexOf(stateCalls[0]!)).toBeLessThan(
+      s.fetchCalls.findIndex(isModeRequest),
+    );
 
     // Follower again: the controller stops with the poller, so the tracker
     // still reading 0 brings no further request.
@@ -275,6 +306,7 @@ describe("service.ts wiring (L7)", () => {
       receivedAt: new Date().toISOString(),
       liveEventId: 1,
       isActive: true,
+      stateVersion: null,
     };
     await settle(12_000);
     expect(s.fetchCalls.some((u) => u.startsWith(CONFIG.sourceUrl))).toBe(true);
