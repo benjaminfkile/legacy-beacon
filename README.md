@@ -1,6 +1,6 @@
 # legacy-beacon
 
-The WMSFO v2 legacy beacon: one service that polls the legacy Heroku tracker once a second and posts what it reports, normalized to the API's location body, to both dev and prod as an enrolled beacon in each. It has a control page on the local network for the tracker's mode and the two beacons, and runs as a systemd service on one host that starts at boot with no login.
+The WMSFO v2 legacy beacon: one service that polls the legacy Heroku tracker every 3 seconds and posts what it reports, normalized to the API's location body, to both dev and prod as an enrolled beacon in each. It has a control page on the local network for the tracker's mode and the two beacons, and runs as a systemd service on one host that starts at boot with no login.
 
 Read `docs/` before touching anything:
 

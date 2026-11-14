@@ -40,7 +40,7 @@ describe("config (legacy-beacon.md 6)", () => {
     expect(c.targets.map((t) => t.name)).toEqual(["dev", "prod"]);
     expect(c.targets[0]!.apiBaseUrl).toBe("https://api-dev.example.com");
     expect(c.targets[1]!.beaconKey).toBe(PROD_KEY);
-    expect(c.pollMs).toBe(1000);
+    expect(c.pollMs).toBe(3000);
     expect(c.httpHost).toBe("0.0.0.0");
     expect(c.httpPort).toBe(3070);
     expect(c.webDir).toBeNull();

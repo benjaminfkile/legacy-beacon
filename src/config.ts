@@ -35,7 +35,7 @@ export class ConfigError extends Error {
 }
 
 const TARGET_NAMES = ["dev", "prod"] as const;
-const DEFAULT_POLL_MS = 1000;
+const DEFAULT_POLL_MS = 3000;
 const MIN_POLL_MS = 250;
 const MAX_POLL_MS = 60_000;
 const DEFAULT_HTTP_HOST = "0.0.0.0";

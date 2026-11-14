@@ -2,7 +2,7 @@
 // `Accept: application/json`, no credentials. A non-2xx, a timeout, or a body
 // that is not a JSON object counts as a failed poll: the last fix is kept,
 // `consecutiveFailures` increments, the next poll is on schedule (no backoff
-// on the source; it is one small GET a second). A successful poll resets the
+// on the source; it is one small GET every few seconds). A successful poll resets the
 // counter, keeps the raw payload for the status and the heartbeat, and hands
 // the normalized fix to onFix, which feeds every target.
 

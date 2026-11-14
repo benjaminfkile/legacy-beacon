@@ -1,6 +1,6 @@
 # Legacy beacon: technical design
 
-The legacy beacon is two ordinary enrolled beacons (contracts 9) in one process, fed by one source: it polls `https://<legacy-tracker-host>/get?id=<tracker id>` once a second, normalizes whatever comes back into the location body of contracts 4.2, and posts that same fix every second, in every mode, to every WMSFO environment it is configured for (dev and prod), over each environment's hub with the HTTP fallback every beacon has. To each API it is one more beacon with its own key. It heartbeats every 15 s per environment with the raw legacy payload and its poll statistics as its `debug` object. It has a control page on the local network that shows the tracker, its mode, and both beacons, and sets the tracker's mode on request. It runs as a systemd service on one host on the operator's network, starts at boot with no login, and is not a fleet service.
+The legacy beacon is two ordinary enrolled beacons (contracts 9) in one process, fed by one source: it polls `https://<legacy-tracker-host>/get?id=<tracker id>` every 3 seconds, normalizes whatever comes back into the location body of contracts 4.2, and posts that same fix after every poll, in every mode, to every WMSFO environment it is configured for (dev and prod), over each environment's hub with the HTTP fallback every beacon has. To each API it is one more beacon with its own key. It heartbeats every 15 s per environment with the raw legacy payload and its poll statistics as its `debug` object. It has a control page on the local network that shows the tracker, its mode, and both beacons, and sets the tracker's mode on request. It runs as a systemd service on one host on the operator's network, starts at boot with no login, and is not a fleet service.
 
 Every name, shape, path, and rule below is the one in the shared contracts (`docs/contracts.md`); the contract wins on any difference. Choices this document makes are in section 10; choices that need the owner are in section 11.
 
@@ -46,7 +46,7 @@ legacy-beacon/
 ## 2. What it does
 
 1. Boots, verifies configuration, builds one beacon (`createBeacon`) per target, starts every beacon core (socket loop, send loop, heartbeat loop), starts the poller, and serves the HTTP surface on `LB_HTTP_HOST:LB_HTTP_PORT` (default `0.0.0.0:3070`).
-2. Every `LB_POLL_MS` (1000) the poller fetches the source and normalizes the answer; each usable fix becomes the latest fix of every target's beacon (`setLatestFix` and `wake` on each), so dev and prod post the same point from the same poll. The send loop of each target posts it over its hub or HTTP like any beacon.
+2. Every `LB_POLL_MS` (3000) the poller fetches the source and normalizes the answer; each usable fix becomes the latest fix of every target's beacon (`setLatestFix` and `wake` on each), so dev and prod post the same point from the same poll. The send loop of each target posts it over its hub or HTTP like any beacon.
 3. Heartbeats go every 15 s per target; `health.socketState` is that target's socket state, `health.lastFixAgeS` the age of the last successful poll (so a dead source shows as "no recent fix" on the panel), `health.batteryPercent` absent; `debug` is section 5.
 4. A mode request from the control page (`POST /api/mode`) sets the tracker's mode (section 3). Nothing else changes the mode: what is posted never depends on it.
 
@@ -56,7 +56,7 @@ A target is one WMSFO environment: an API base URL, a hub URL, an ingest channel
 
 ## 3. The source, the normalizer, and the mode
 
-**Poller.** `GET LB_SOURCE_URL` with a 3 s timeout, `Accept: application/json`, no credentials (the endpoint is public). A non-2xx, a timeout, or a body that is not a JSON object counts as a failed poll: the last fix is kept, `consecutiveFailures` increments, the next poll is on schedule (no backoff on the source; it is one small GET a second). A successful poll resets the counter, stamps `lastSuccessAt`, and keeps the raw payload and the normalized fix.
+**Poller.** `GET LB_SOURCE_URL` with a 3 s timeout, `Accept: application/json`, no credentials (the endpoint is public). A non-2xx, a timeout, or a body that is not a JSON object counts as a failed poll: the last fix is kept, `consecutiveFailures` increments, the next poll is on schedule (no backoff on the source; it is one small GET every few seconds). A successful poll resets the counter, stamps `lastSuccessAt`, and keeps the raw payload and the normalized fix.
 
 **The legacy payload** (as observed on 2026-09-12, every value a string except `mode`, `redirect`, `count`):
 
@@ -124,7 +124,7 @@ Per target, built by `buildHeartbeatHealth` and `buildHeartbeatDebug` in `heartb
 ```json
 {
   "target": "prod",
-  "source": { "url": "https://<legacy-tracker-host>/get?id=<tracker id>", "pollMs": 1000, "lastPollAt": "...", "lastStatus": 200, "lastLatencyMs": 143,
+  "source": { "url": "https://<legacy-tracker-host>/get?id=<tracker id>", "pollMs": 3000, "lastPollAt": "...", "lastStatus": 200, "lastLatencyMs": 143,
               "consecutiveFailures": 0, "pollsOk": 3600, "pollsFailed": 2, "mode": 1, "lastPayload": { "...the raw legacy object..." } },
   "normalized": { "lat": 46.91852, "lng": -114.090039, "speedMps": 0, "altitudeM": 827.5, "headingDeg": 0, "recordedAt": "..." },
   "transport": { "socketState": "connected", "reconnectCount": 0, "httpFallbackSeconds": 0, "lastReceiptLatencyMs": 88, "sendsFailedSinceBoot": 0 },
@@ -148,7 +148,7 @@ Environment file `/etc/legacy-beacon/legacy-beacon.env` on the host (owner root,
 | `LB_<TARGET>_BEACON_KEY` | the `wbk_` key of the beacon named `legacy` in that environment |
 | `LB_<TARGET>_HUB_URL`, `LB_<TARGET>_INGEST_CHANNEL` | `wss://<hub-domain>/hub`, `<service>:ingest` (`wmsfo-api-dev:ingest` for dev, `wmsfo-api:ingest` for prod) |
 | `LB_SOURCE_URL` | `https://<legacy-tracker-host>/get?id=<tracker id>` |
-| `LB_POLL_MS` (optional) | `1000` (250 to 60000) |
+| `LB_POLL_MS` (optional) | `3000` (250 to 60000) |
 | `LB_MODE_URL` (optional) | `https://<legacy-tracker-host>/mode?id=<tracker id>`, the mode endpoint with its `id` and without `auth` or `value`; set together with `LB_MODE_AUTH` |
 | `LB_MODE_AUTH` (optional) | `<mode token>`, the legacy tracker's mode token; set together with `LB_MODE_URL` |
 | `LB_HTTP_HOST` (optional) | `0.0.0.0` |
@@ -205,7 +205,7 @@ The beacon core's own suites (socket loop, send loop, heartbeat loop, hub) live 
 - The mode is set only by the operator from the control page; the service never sets it on its own. Dev and prod heartbeats could disagree about whether an event is live, and one tracker cannot follow both (the operator, 2026-11-14).
 - The service runs on one host on the operator's network as a systemd unit, not on the fleet: one process, no leader gate, no container.
 - The control page has no sign-in; it is reachable from the local network only (the operator, 2026-11-14).
-- The legacy beacon posts every second in every mode; each API's live-event rule decides what is stored. No point-change detection.
+- The legacy beacon polls every 3 seconds (the operator, 2026-11-14) and posts every polled fix in every mode; each API's live-event rule decides what is stored. No point-change detection.
 - Units are converted at the edge: mph to metres per second, feet to metres, `bearing_raw` degrees as heading; accuracy is unknown and sent as null.
 - `time` 0 (pre-show) becomes the poll time so `recordedAt` is always a real instant.
 
