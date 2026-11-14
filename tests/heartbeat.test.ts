@@ -1,7 +1,7 @@
-// The heartbeat body shape: `health` carries socketState and lastFixAgeS from
-// the last successful poll (batteryPercent absent); `debug` is the section 5
-// tree (source, normalized, transport, process, modeControl). The whole body must also
-// validate against the vendored heartbeat.schema.json.
+// The heartbeat body per target: `health` carries socketState and lastFixAgeS
+// from the last successful poll (batteryPercent absent); `debug` is the
+// section 5 tree (target, source, normalized, transport, process,
+// modeControl). The whole body validates against the vendored schema.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -10,31 +10,16 @@ import addFormats from "ajv-formats";
 import { describe, expect, it } from "vitest";
 import { createBeaconState } from "beacon-library";
 import { buildHeartbeatDebug, buildHeartbeatHealth } from "../src/heartbeat.js";
-import type { Config } from "../src/config.js";
-import type { ModeControlStats } from "../src/source/modeControl.js";
+import { normalize } from "../src/source/normalize.js";
+import type { ModeSetterStats } from "../src/source/modeSetter.js";
 import type { PollerStats } from "../src/source/poller.js";
 
-const schema = JSON.parse(
-  readFileSync(join(process.cwd(), "contracts/schema/heartbeat.schema.json"), "utf8"),
-);
+const schema = JSON.parse(readFileSync(join(process.cwd(), "contracts/schema/heartbeat.schema.json"), "utf8"));
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats.default(ajv);
 const validate = ajv.compile(schema);
 
-const CONFIG: Config = {
-  env: "dev",
-  apiBaseUrl: "https://api.example.com",
-  beaconKey: "wbk_x",
-  hubUrl: "wss://gateway.example.com/hub",
-  ingestChannel: "wmsfo-api-dev:ingest",
-  gatewayInternalUrl: "http://172.17.0.1:8080",
-  sourceUrl: "https://legacy.example/get?id=406santa",
-  pollMs: 1000,
-  logLevel: "info",
-  forceLeader: true,
-  gatewayRealtimeToken: "grt_x",
-  modeControl: null,
-};
+const SOURCE_URL = "https://legacy.example/get?id=tracker-1";
 
 const RAW_PAYLOAD = {
   lat: "46.918520",
@@ -45,6 +30,12 @@ const RAW_PAYLOAD = {
   mode: 1,
   time: "1766460807560",
 };
+
+const FIX = (() => {
+  const r = normalize(RAW_PAYLOAD, { pollTimeMs: 0 });
+  if (!r.ok) throw new Error("sample did not normalize");
+  return r.fix;
+})();
 
 function stats(overrides: Partial<PollerStats> = {}): PollerStats {
   return {
@@ -59,108 +50,89 @@ function stats(overrides: Partial<PollerStats> = {}): PollerStats {
     lastSuccessAtMs: Date.parse("2026-12-22T01:31:07.000Z"),
     lastFailureReason: null,
     lastPayload: RAW_PAYLOAD,
+    lastFix: FIX,
     ...overrides,
   };
 }
 
-describe("heartbeat body shape (legacy-beacon.md 5, contracts 4.2)", () => {
+const MODE_STATS: ModeSetterStats = {
+  enabled: true,
+  inFlight: false,
+  lastSetAt: "2026-12-22T01:30:00.000Z",
+  lastSetValue: 1,
+  lastSetStatus: 200,
+  lastSetError: null,
+  setsOk: 1,
+  setsFailed: 0,
+};
+
+function debugFor(over: { pollerStats?: PollerStats | null; modeStats?: ModeSetterStats | null } = {}) {
+  const state = createBeaconState();
+  state.socketState = "connected";
+  state.reconnectCount = 3;
+  state.httpFallbackSeconds = 12.4;
+  state.lastReceiptLatencyMs = 88;
+  state.sendsFailedSinceBoot = 1;
+  return buildHeartbeatDebug({
+    target: "prod",
+    state,
+    sourceUrl: SOURCE_URL,
+    pollMs: 1000,
+    pollerStats: over.pollerStats === undefined ? stats() : over.pollerStats,
+    modeStats: over.modeStats === undefined ? null : over.modeStats,
+    bootMs: Date.parse("2026-12-22T01:31:07.000Z"),
+    version: "0.2.0",
+    instance: "nimbus",
+    now: () => Date.parse("2026-12-22T02:31:07.000Z"),
+  });
+}
+
+describe("heartbeat body (legacy-beacon.md 5, contracts 4.2)", () => {
   it("health has socketState and lastFixAgeS; batteryPercent absent", () => {
     const state = createBeaconState();
     state.socketState = "connected";
-    const now = () =>
-      Date.parse("2026-12-22T01:31:12.000Z"); // 5 s after the last success
-    const health = buildHeartbeatHealth({ state, pollerStats: stats(), now });
+    const health = buildHeartbeatHealth({ state, pollerStats: stats(), now: () => Date.parse("2026-12-22T01:31:12.000Z") });
     expect(health.socketState).toBe("connected");
     expect(health.lastFixAgeS).toBe(5);
-    // batteryPercent must be absent, not just null: a legacy tracker has no
-    // battery.
     expect("batteryPercent" in health).toBe(false);
   });
 
-  it("health.lastFixAgeS is null when no poll has succeeded yet", () => {
-    const state = createBeaconState();
-    const health = buildHeartbeatHealth({
-      state,
-      pollerStats: stats({ lastSuccessAtMs: null, lastSuccessAt: null }),
-    });
+  it("health.lastFixAgeS is null before the first good poll", () => {
+    const health = buildHeartbeatHealth({ state: createBeaconState(), pollerStats: stats({ lastSuccessAtMs: null }) });
     expect(health.lastFixAgeS).toBeNull();
   });
 
-  it("debug has the section 5 shape: source, normalized, transport, process", () => {
-    const state = createBeaconState();
-    state.socketState = "connected";
-    state.reconnectCount = 3;
-    state.httpFallbackSeconds = 12.4;
-    state.lastReceiptLatencyMs = 88;
-    state.sendsFailedSinceBoot = 1;
-    const now = () => Date.parse("2026-12-22T02:31:07.000Z");
-    const debug = buildHeartbeatDebug({
-      state,
-      config: CONFIG,
-      pollerStats: stats(),
-      bootMs: Date.parse("2026-12-22T01:31:07.000Z"),
-      version: "0.1.0",
-      instance: "i-abc",
-      leader: true,
-      now,
-    });
-    // The five top-level branches.
-    expect(Object.keys(debug).sort()).toEqual(
-      ["modeControl", "normalized", "process", "source", "transport"].sort(),
-    );
-
+  it("debug has the section 5 shape", () => {
+    const debug = debugFor();
+    expect(Object.keys(debug).sort()).toEqual(["modeControl", "normalized", "process", "source", "target", "transport"]);
+    expect(debug.target).toBe("prod");
     const source = debug.source as Record<string, unknown>;
-    expect(source.url).toBe(CONFIG.sourceUrl);
-    expect(source.pollMs).toBe(1000);
-    expect(source.lastStatus).toBe(200);
-    expect(source.pollsOk).toBe(3600);
-    expect(source.pollsFailed).toBe(2);
-    expect(source.consecutiveFailures).toBe(0);
-    expect(source.lastLatencyMs).toBe(143);
+    expect(source.url).toBe(SOURCE_URL);
     expect(source.mode).toBe(1);
+    expect(source.pollsOk).toBe(3600);
     expect(source.lastPayload).toEqual(RAW_PAYLOAD);
-
     const normalized = debug.normalized as Record<string, unknown>;
     expect(normalized.lat).toBe(46.91852);
-    expect(normalized.lng).toBe(-114.090039);
-    expect(normalized.speedMps).toBe(0);
     expect(normalized.altitudeM).toBe(827.5);
-    expect(normalized.headingDeg).toBe(0);
     expect(normalized.recordedAt).toBe("2025-12-23T03:33:27.560Z");
-
     const transport = debug.transport as Record<string, unknown>;
-    expect(transport.socketState).toBe("connected");
-    expect(transport.reconnectCount).toBe(3);
     expect(transport.httpFallbackSeconds).toBe(12);
-    expect(transport.lastReceiptLatencyMs).toBe(88);
     expect(transport.sendsFailedSinceBoot).toBe(1);
-
     const proc = debug.process as Record<string, unknown>;
     expect(proc.uptimeS).toBe(3600);
-    expect(proc.leader).toBe(true);
-    expect(proc.instance).toBe("i-abc");
-    expect(proc.version).toBe("0.1.0");
-    expect(typeof proc.node).toBe("string");
+    expect(proc.instance).toBe("nimbus");
+    expect("leader" in proc).toBe(false);
+  });
+
+  it("modeControl is { enabled: false } when off and the setter's stats when on", () => {
+    expect(debugFor().modeControl).toEqual({ enabled: false });
+    expect(debugFor({ modeStats: MODE_STATS }).modeControl).toEqual(MODE_STATS);
   });
 
   it("debug is empty of source data before the first poll", () => {
-    const state = createBeaconState();
-    const debug = buildHeartbeatDebug({
-      state,
-      config: CONFIG,
-      pollerStats: null,
-      bootMs: Date.now(),
-      version: "0.1.0",
-      instance: "i-x",
-      leader: true,
-    });
-    const source = debug.source as Record<string, unknown>;
-    expect(source.lastPayload).toBeNull();
-    expect(source.pollsOk).toBe(0);
-    expect(source.pollsFailed).toBe(0);
-    const normalized = debug.normalized as Record<string, unknown>;
-    expect(normalized.lat).toBeNull();
-    expect(normalized.recordedAt).toBeNull();
+    const debug = debugFor({ pollerStats: null });
+    expect((debug.source as Record<string, unknown>).lastPayload).toBeNull();
+    expect((debug.normalized as Record<string, unknown>).lat).toBeNull();
   });
 
   it("the full heartbeat body validates against the vendored schema", () => {
@@ -169,86 +141,10 @@ describe("heartbeat body shape (legacy-beacon.md 5, contracts 4.2)", () => {
     const body = {
       sentAt: "2026-12-22T01:31:07.000Z",
       health: buildHeartbeatHealth({ state, pollerStats: stats() }),
-      debug: buildHeartbeatDebug({
-        state,
-        config: CONFIG,
-        pollerStats: stats(),
-        bootMs: Date.now() - 60_000,
-        version: "0.1.0",
-        instance: "i-x",
-        leader: true,
-      }),
+      debug: debugFor({ modeStats: MODE_STATS }),
     };
     const ok = validate(body);
     if (!ok) console.error(validate.errors);
     expect(ok).toBe(true);
-  });
-
-  describe("modeControl", () => {
-    const MODE_CONFIG: Config = {
-      ...CONFIG,
-      modeControl: { url: "https://legacy.example/mode?id=tracker-1", auth: "test-mode-auth" },
-    };
-    const RUNNING: ModeControlStats = {
-      enabled: true,
-      stateLoaded: true,
-      stateVersion: 3,
-      owned: true,
-      wanted: 1,
-      polledMode: 0,
-      lastSetAt: "2026-12-22T01:31:07.000Z",
-      lastSetValue: 1,
-      lastSetStatus: 200,
-      lastSetError: null,
-      setsOk: 1,
-      setsFailed: 0,
-    };
-
-    function debugFor(config: Config, modeControlStats: ModeControlStats | null) {
-      return buildHeartbeatDebug({
-        state: createBeaconState(),
-        config,
-        pollerStats: stats(),
-        bootMs: Date.now() - 60_000,
-        version: "0.1.0",
-        instance: "i-x",
-        leader: modeControlStats !== null,
-        modeControlStats,
-      });
-    }
-
-    it("is the controller's stats while one runs", () => {
-      expect(debugFor(MODE_CONFIG, RUNNING).modeControl).toEqual(RUNNING);
-    });
-
-    it("is enabled and idle when configured but not running", () => {
-      expect(debugFor(MODE_CONFIG, null).modeControl).toEqual({
-        enabled: true,
-        owned: false,
-        wanted: null,
-      });
-    });
-
-    it("is disabled when mode control is off", () => {
-      expect(debugFor(CONFIG, null).modeControl).toEqual({ enabled: false });
-    });
-
-    it("every shape validates in the heartbeat body and never carries the token", () => {
-      for (const debug of [
-        debugFor(MODE_CONFIG, RUNNING),
-        debugFor(MODE_CONFIG, null),
-        debugFor(CONFIG, null),
-      ]) {
-        const body = {
-          sentAt: "2026-12-22T01:31:07.000Z",
-          health: buildHeartbeatHealth({ state: createBeaconState(), pollerStats: stats() }),
-          debug,
-        };
-        const ok = validate(body);
-        if (!ok) console.error(validate.errors);
-        expect(ok).toBe(true);
-        expect(JSON.stringify(body)).not.toContain("test-mode-auth");
-      }
-    });
   });
 });

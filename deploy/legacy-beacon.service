@@ -1,0 +1,22 @@
+# systemd system unit for the legacy beacon (legacy-beacon.md 7). A system
+# unit starts at boot with no login. scripts/install-service.sh fills in the
+# @...@ values and installs it as /etc/systemd/system/legacy-beacon.service.
+[Unit]
+Description=WMSFO legacy beacon (Heroku tracker to dev and prod, control page)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/legacy-beacon/legacy-beacon.env
+ExecStart=@NODE@ --enable-source-maps dist/main.js
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

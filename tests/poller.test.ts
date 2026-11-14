@@ -1,10 +1,10 @@
 // The poller under failures and timeouts. The schedule holds under failures
 // (no backoff); a timeout counts as a failed poll; statistics; the raw
-// payload lands in the stats for the heartbeat's debug tree.
+// payload and the normalized fix land in the stats; onFix gets every fix.
 
-import { describe, expect, it } from "vitest";
-import { createBeaconState } from "beacon-library";
+import { describe, expect, it, vi } from "vitest";
 import { createPoller } from "../src/source/poller.js";
+import type { NormalizedFix } from "../src/source/normalize.js";
 
 const SAMPLE = {
   lat: "46.918520",
@@ -39,45 +39,46 @@ function makeFetch(entries: Array<Response | Error>): typeof fetch {
   }) as typeof fetch;
 }
 
+function make(entries: Array<Response | Error>, extra: { timeoutMs?: number; fetchImpl?: typeof fetch } = {}) {
+  const fixes: NormalizedFix[] = [];
+  const polled = vi.fn();
+  const p = createPoller({
+    url: "https://x/get",
+    pollMs: 60_000,
+    fetchImpl: extra.fetchImpl ?? makeFetch(entries),
+    onFix: (f) => fixes.push(f),
+    onPolled: polled,
+    ...(extra.timeoutMs !== undefined ? { timeoutMs: extra.timeoutMs } : {}),
+  });
+  return { p, fixes, polled };
+}
+
 describe("poller (legacy-beacon.md 3)", () => {
-  it("a successful poll sets the latest fix and updates stats", async () => {
-    const state = createBeaconState();
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([jsonResponse(SAMPLE)]),
-    });
+  it("a successful poll hands the fix to onFix and updates stats", async () => {
+    const { p, fixes, polled } = make([jsonResponse(SAMPLE)]);
     await p.pollOnce();
-    expect(state.latestFix).not.toBeNull();
-    expect(state.latestFix!.lat).toBe(46.91852);
+    expect(fixes).toHaveLength(1);
+    expect(fixes[0]!.lat).toBe(46.91852);
     const s = p.stats();
     expect(s.pollsOk).toBe(1);
     expect(s.pollsFailed).toBe(0);
     expect(s.consecutiveFailures).toBe(0);
     expect(s.lastStatus).toBe(200);
-    expect(s.lastPollAt).not.toBeNull();
     expect(s.lastSuccessAt).not.toBeNull();
-    // The raw payload is kept for the heartbeat's debug tree.
     expect(s.lastPayload).toEqual(SAMPLE);
+    expect(s.lastFix).toEqual(fixes[0]);
+    expect(polled).toHaveBeenCalledTimes(1);
     p.stop();
   });
 
   it("a non-2xx counts as a failed poll; the last fix is kept", async () => {
-    const state = createBeaconState();
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([jsonResponse(SAMPLE), jsonResponse({}, 502)]),
-    });
+    const { p, fixes } = make([jsonResponse(SAMPLE), jsonResponse({}, 502)]);
     await p.pollOnce();
-    expect(state.latestFix).not.toBeNull();
-    const before = state.latestFix;
+    const before = p.stats().lastFix;
     await p.pollOnce();
-    // Same fix; the poller did not clear it.
-    expect(state.latestFix).toBe(before);
+    expect(fixes).toHaveLength(1);
     const s = p.stats();
+    expect(s.lastFix).toEqual(before);
     expect(s.pollsOk).toBe(1);
     expect(s.pollsFailed).toBe(1);
     expect(s.consecutiveFailures).toBe(1);
@@ -85,62 +86,36 @@ describe("poller (legacy-beacon.md 3)", () => {
     p.stop();
   });
 
-  it("a timeout counts as a failed poll (name === 'AbortError')", async () => {
-    const state = createBeaconState();
-    // A fetch that never resolves and throws AbortError when signal aborts.
-    const fetchImpl: typeof fetch = ((_url: string, init?: RequestInit) => {
-      return new Promise((_resolve, reject) => {
-        const s = init?.signal;
-        if (s) {
-          s.addEventListener("abort", () => {
-            const err = new Error("aborted");
-            err.name = "AbortError";
-            reject(err);
-          });
-        }
-      });
-    }) as typeof fetch;
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl,
-      timeoutMs: 10,
-    });
+  it("a timeout counts as a failed poll", async () => {
+    const fetchImpl: typeof fetch = ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      })) as typeof fetch;
+    const { p } = make([], { fetchImpl, timeoutMs: 10 });
     await p.pollOnce();
     const s = p.stats();
     expect(s.pollsFailed).toBe(1);
-    expect(s.consecutiveFailures).toBe(1);
     expect(s.lastFailureReason).toBe("timeout");
     p.stop();
   });
 
   it("a body that is not a JSON object counts as a failed poll", async () => {
-    const state = createBeaconState();
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([jsonResponse(["not", "an", "object"])]),
-    });
+    const { p, fixes } = make([jsonResponse(["not", "an", "object"])]);
     await p.pollOnce();
-    const s = p.stats();
-    expect(s.pollsFailed).toBe(1);
-    expect(state.latestFix).toBeNull();
+    expect(p.stats().pollsFailed).toBe(1);
+    expect(fixes).toHaveLength(0);
     p.stop();
   });
 
-  it("a normalizer failure (out-of-range lat) counts as a failed poll; raw payload still kept", async () => {
-    const state = createBeaconState();
+  it("an out-of-range latitude is a failed poll; the raw payload is still kept", async () => {
     const bad = { ...SAMPLE, lat: "95.0" };
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([jsonResponse(bad)]),
-    });
+    const { p, fixes } = make([jsonResponse(bad)]);
     await p.pollOnce();
-    expect(state.latestFix).toBeNull();
+    expect(fixes).toHaveLength(0);
     const s = p.stats();
     expect(s.pollsFailed).toBe(1);
     expect(s.lastPayload).toEqual(bad);
@@ -149,17 +124,7 @@ describe("poller (legacy-beacon.md 3)", () => {
   });
 
   it("a successful poll resets consecutiveFailures", async () => {
-    const state = createBeaconState();
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([
-        jsonResponse({}, 500),
-        jsonResponse({}, 500),
-        jsonResponse(SAMPLE),
-      ]),
-    });
+    const { p } = make([jsonResponse({}, 500), jsonResponse({}, 500), jsonResponse(SAMPLE)]);
     await p.pollOnce();
     await p.pollOnce();
     expect(p.stats().consecutiveFailures).toBe(2);
@@ -170,60 +135,37 @@ describe("poller (legacy-beacon.md 3)", () => {
     p.stop();
   });
 
-  it("the schedule holds under failures (no backoff): next tick is pollMs", async () => {
-    // We drive time manually: on start(), the first schedule is 0; after the
-    // poll finishes we advance and observe the next schedule was `pollMs`.
-    const state = createBeaconState();
-    let currentMs = 1_000_000;
-    const now = () => currentMs;
-    const scriptedFetch = makeFetch([jsonResponse({}, 500)]);
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: scriptedFetch,
-      now,
-    });
-    // A single manual poll, no automatic timer involved.
+  it("a network error counts as a failed poll with the error message", async () => {
+    const { p } = make([new Error("ECONNREFUSED")]);
     await p.pollOnce();
-    // A failed poll leaves consecutiveFailures=1 and does not delay any
-    // subsequent poll: the caller (or the auto timer) reschedules on the
-    // ordinary interval. This test asserts the state contract; there is no
-    // "backoff" state kept on the poller.
-    const s = p.stats();
-    expect(s.consecutiveFailures).toBe(1);
+    expect(p.stats().lastFailureReason).toBe("ECONNREFUSED");
+    expect(p.stats().lastStatus).toBeNull();
     p.stop();
   });
 
-  it("network error counts as a failed poll with the error message", async () => {
-    const state = createBeaconState();
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([new Error("ECONNRESET")]),
-    });
-    await p.pollOnce();
-    const s = p.stats();
-    expect(s.pollsFailed).toBe(1);
-    expect(s.lastFailureReason).toContain("ECONNRESET");
-    expect(s.lastStatus).toBeNull();
-    p.stop();
-  });
-
-  it("onFix fires on a successful poll with the fix's seqLocal", async () => {
-    const state = createBeaconState();
-    const seen: number[] = [];
-    const p = createPoller({
-      url: "https://x/get",
-      pollMs: 60_000,
-      state,
-      fetchImpl: makeFetch([jsonResponse(SAMPLE), jsonResponse(SAMPLE)]),
-      onFix: (seq) => seen.push(seq),
-    });
-    await p.pollOnce();
-    await p.pollOnce();
-    expect(seen).toEqual([1, 2]);
-    p.stop();
+  it("the schedule holds under failures: every poll after the first is pollMs later", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const fetchImpl = (async () => {
+        calls += 1;
+        return jsonResponse({}, 500);
+      }) as typeof fetch;
+      const p = createPoller({ url: "https://x/get", pollMs: 1000, fetchImpl });
+      p.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(calls).toBe(5);
+      p.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(calls).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

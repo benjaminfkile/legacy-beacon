@@ -3,11 +3,10 @@
 // that is not a JSON object counts as a failed poll: the last fix is kept,
 // `consecutiveFailures` increments, the next poll is on schedule (no backoff
 // on the source; it is one small GET a second). A successful poll resets the
-// counter and stamps `lastPollAt`. The raw payload is kept for the heartbeat's
-// debug object.
+// counter, keeps the raw payload for the status and the heartbeat, and hands
+// the normalized fix to onFix, which feeds every target.
 
-import { setLatestFix, type BeaconState } from "beacon-library";
-import { normalize, type LegacyPayload } from "./normalize.js";
+import { normalize, type LegacyPayload, type NormalizedFix } from "./normalize.js";
 
 export interface PollerStats {
   lastPollAt: string | null;
@@ -21,16 +20,16 @@ export interface PollerStats {
   lastSuccessAtMs: number | null;
   lastFailureReason: string | null;
   lastPayload: LegacyPayload | null;
+  lastFix: NormalizedFix | null;
 }
 
 export interface PollerOptions {
   url: string;
   pollMs: number;
-  state: BeaconState;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   now?: () => number;
-  onFix?: (seqLocal: number) => void;
+  onFix?: (fix: NormalizedFix) => void;
   onError?: (reason: string) => void;
   // Called after every completed poll, successful or not, once the stats are
   // updated.
@@ -61,6 +60,7 @@ function createStats(): PollerStats {
     lastSuccessAtMs: null,
     lastFailureReason: null,
     lastPayload: null,
+    lastFix: null,
   };
 }
 
@@ -68,7 +68,6 @@ export function createPoller(opts: PollerOptions): Poller {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 3000;
   const now = opts.now ?? (() => Date.now());
-  const state = opts.state;
   const stats: PollerStats = createStats();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
@@ -126,6 +125,7 @@ export function createPoller(opts: PollerOptions): Poller {
       stats.lastLatencyMs = now() - started;
       stats.lastStatus = res.status;
       if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
         markFailure(`http ${res.status}`, res.status);
         return;
       }
@@ -144,7 +144,7 @@ export function createPoller(opts: PollerOptions): Poller {
         return;
       }
       const raw = payload as LegacyPayload;
-      // Keep the raw payload for the heartbeat's debug tree regardless of
+      // Keep the raw payload for the status and the heartbeat regardless of
       // whether the position is usable.
       stats.lastPayload = raw;
       const result = normalize(raw, { pollTimeMs: now() });
@@ -152,13 +152,13 @@ export function createPoller(opts: PollerOptions): Poller {
         markFailure(result.reason, res.status);
         return;
       }
-      const fix = setLatestFix(state, result.fix);
       stats.consecutiveFailures = 0;
       stats.pollsOk += 1;
       stats.lastSuccessAtMs = now();
       stats.lastSuccessAt = isoNow(stats.lastSuccessAtMs);
       stats.lastFailureReason = null;
-      opts.onFix?.(fix.seqLocal);
+      stats.lastFix = result.fix;
+      opts.onFix?.(result.fix);
     } finally {
       clearTimeout(to);
       inFlight = false;
@@ -167,6 +167,7 @@ export function createPoller(opts: PollerOptions): Poller {
   }
 
   function start(): void {
+    stopped = false;
     schedule(0);
   }
 
@@ -178,5 +179,5 @@ export function createPoller(opts: PollerOptions): Poller {
     }
   }
 
-  return { start, stop, pollOnce, stats: () => stats };
+  return { start, stop, pollOnce, stats: () => ({ ...stats }) };
 }

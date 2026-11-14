@@ -16,6 +16,9 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
       - run: npm ci
       - name: contracts check
         env:
@@ -26,5 +29,11 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - name: docker build
-        run: docker build -t legacy-beacon:ci .
+      - name: control page
+        working-directory: web
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm test
+          npm run build

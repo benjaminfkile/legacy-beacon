@@ -1,316 +1,158 @@
-// The wiring in src/service.ts: gateOnLeader owns the poller through onStart
-// and onStop, so the poller runs only while this node is leader; a polled fix
-// reaches the fake hub while the socket is connected. With mode control on,
-// the mode controller runs only while this node is leader, reading the state
-// document before its first request; with it off no mode request is ever made.
+// The wiring in src/service.ts: one poller feeds both targets, so a polled fix
+// reaches the dev and the prod fake hub alike; heartbeats go to both APIs
+// with their own target in debug; the status lists both; a mode request from
+// the HTTP surface reaches the legacy tracker with id, auth, and value, and
+// with mode control off no mode request is ever made.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FakeHubClient, type HubClient, type HubOptions } from "beacon-library";
-import pino from "pino";
-import { startService } from "../src/service.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { FakeHubClient, type HubOptions } from "beacon-library";
+import { pino } from "pino";
+import { startService, type Service } from "../src/service.js";
 import type { Config } from "../src/config.js";
 
-const CONFIG: Config = {
-  env: "dev",
-  apiBaseUrl: "https://api.example.com",
-  beaconKey: "wbk_x",
-  hubUrl: "wss://gateway.example.com/hub",
-  ingestChannel: "wmsfo-api-dev:ingest",
-  gatewayInternalUrl: "http://172.17.0.1:8080",
-  sourceUrl: "https://source.example.com/get",
-  pollMs: 250,
-  logLevel: "silent",
-  forceLeader: false,
-  gatewayRealtimeToken: "grt_x",
-  modeControl: null,
-};
+const SOURCE_URL = "https://legacy.example/get?id=tracker-1";
+const MODE_URL = "https://legacy.example/mode?id=tracker-1";
+const MODE_AUTH = "test-mode-auth";
 
-const LEGACY_SAMPLE = {
-  lat: "46.918520",
-  lon: "-114.090039",
-  speed: "0.00 mph",
-  alt: "2715 ft",
-  bearing_raw: "0",
-  mode: 1,
-  time: "1766460807560",
-};
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-const MODE_CONFIG = {
-  url: "https://legacy.example/mode?id=tracker-1",
-  auth: "test-mode-auth",
-};
-
-function isModeRequest(u: string): boolean {
-  return u.startsWith("https://legacy.example/mode");
-}
-
-interface Scenario {
-  hub: FakeHubClient;
-  fetchCalls: string[];
-  setLeader: (v: boolean) => void;
-  setSourceMode: (m: number) => void;
-  modeRequests: () => URL[];
-  buildHub: (o: HubOptions) => HubClient;
-  fetchImpl: typeof fetch;
-}
-
-function makeScenario(): Scenario {
-  const hub = new FakeHubClient();
-  const fetchCalls: string[] = [];
-  let leaderNow = false;
-  let sourceMode = LEGACY_SAMPLE.mode;
-  let stateDoc: Record<string, unknown> | null = null;
-  let stateVersion = 0;
-  const fetchImpl: typeof fetch = (async (
-    input: Parameters<typeof fetch>[0],
-    init?: RequestInit,
-  ) => {
-    const url =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.toString()
-          : (input as Request).url;
-    fetchCalls.push(url);
-    if (url.includes("/internal/leader")) {
-      return jsonResponse({ isLeader: leaderNow, evaluatedAt: new Date().toISOString() });
-    }
-    if (url.startsWith(CONFIG.sourceUrl)) {
-      return jsonResponse({ ...LEGACY_SAMPLE, mode: sourceMode });
-    }
-    if (isModeRequest(url)) {
-      return new Response("ok", { status: 200 });
-    }
-    if (url.endsWith("/beacons/me/state")) {
-      const method = init?.method ?? "GET";
-      if (method === "PUT") {
-        const body = JSON.parse(String(init?.body)) as { state: Record<string, unknown> };
-        stateDoc = body.state;
-        stateVersion += 1;
-        return jsonResponse({
-          stateVersion,
-          updatedAt: new Date().toISOString(),
-          serverTime: new Date().toISOString(),
-        });
-      }
-      return jsonResponse({
-        state: stateDoc,
-        stateVersion,
-        updatedAt: null,
-        serverTime: new Date().toISOString(),
-      });
-    }
-    if (url.includes("/beacons/heartbeat")) {
-      return jsonResponse({
-        receivedAt: new Date().toISOString(),
-        liveEventId: 1,
-        isActive: true,
-        serverTime: new Date().toISOString(),
-      });
-    }
-    if (url.includes("/locations")) {
-      return jsonResponse({
-        seq: 1,
-        published: true,
-        receivedAt: new Date().toISOString(),
-        serverTime: new Date().toISOString(),
-      });
-    }
-    return jsonResponse({}, 404);
-  }) as typeof fetch;
+function config(modeControl: Config["modeControl"]): Config {
   return {
-    hub,
-    fetchCalls,
-    setLeader: (v) => {
-      leaderNow = v;
-    },
-    setSourceMode: (m) => {
-      sourceMode = m;
-    },
-    modeRequests: () => fetchCalls.filter(isModeRequest).map((u) => new URL(u)),
-    buildHub: () => hub,
-    fetchImpl,
+    targets: [
+      { name: "dev", apiBaseUrl: "https://api-dev.example.com", beaconKey: "wbk_dev", hubUrl: "wss://hub-dev.example.com/hub", ingestChannel: "wmsfo-api-dev:ingest" },
+      { name: "prod", apiBaseUrl: "https://api.example.com", beaconKey: "wbk_prod", hubUrl: "wss://hub.example.com/hub", ingestChannel: "wmsfo-api:ingest" },
+    ],
+    sourceUrl: SOURCE_URL,
+    pollMs: 250,
+    modeControl,
+    httpHost: "127.0.0.1",
+    httpPort: 0,
+    webDir: null,
+    logLevel: "silent",
   };
 }
 
-const log = pino({ level: "silent" });
+const SAMPLE = { lat: "46.918520", lon: "-114.090039", speed: "10.00 mph", alt: "2715 ft", bearing_raw: "90", mode: 1, time: "1766460807560" };
 
-describe("service.ts wiring (L7)", () => {
-  beforeEach(() => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
 
-  it("the poller starts only after this node becomes leader and stops when it becomes follower", async () => {
-    const s = makeScenario();
-    const service = startService(CONFIG, {
-      log,
-      version: "0.1.0",
-      bootMs: Date.now(),
-      instance: "test",
-      fetchImpl: s.fetchImpl,
-      buildHub: s.buildHub,
-      healthPort: 0,
-      startHealth: () => ({ port: () => 0, close: async () => {} }),
-    });
-
-    // Not leader yet: settle a few leader polls; no source poll fired.
-    await vi.advanceTimersByTimeAsync(50);
-    await Promise.resolve();
-    expect(s.fetchCalls.some((u) => u.startsWith(CONFIG.sourceUrl))).toBe(false);
-
-    // Become leader; the source URL is fetched by the poller.
-    s.setLeader(true);
-    // Trigger the next leader poll; default pollMs is 2000.
-    await vi.advanceTimersByTimeAsync(2100);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    // The poller schedule fires immediately on start().
-    await vi.advanceTimersByTimeAsync(50);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    expect(s.fetchCalls.some((u) => u.startsWith(CONFIG.sourceUrl))).toBe(true);
-    const sourceCountAfterLead = s.fetchCalls.filter((u) => u.startsWith(CONFIG.sourceUrl)).length;
-
-    // Fall back to follower; poller stops so no more source polls fire.
-    s.setLeader(false);
-    await vi.advanceTimersByTimeAsync(2100);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    const beforeIdle = s.fetchCalls.filter((u) => u.startsWith(CONFIG.sourceUrl)).length;
-    await vi.advanceTimersByTimeAsync(1000);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    const afterIdle = s.fetchCalls.filter((u) => u.startsWith(CONFIG.sourceUrl)).length;
-    expect(afterIdle).toBe(beforeIdle);
-    expect(sourceCountAfterLead).toBeGreaterThan(0);
-
-    await service.stop();
-  });
-
-  it("a polled fix reaches the hub while the socket is connected", async () => {
-    const s = makeScenario();
-    const forced: Config = { ...CONFIG, forceLeader: true, gatewayRealtimeToken: null };
-    const service = startService(forced, {
-      log,
-      version: "0.1.0",
-      bootMs: Date.now(),
-      instance: "test",
-      fetchImpl: s.fetchImpl,
-      buildHub: s.buildHub,
-      healthPort: 0,
-      startHealth: () => ({ port: () => 0, close: async () => {} }),
-    });
-
-    // Settle: leader forces immediate onStart which starts the poller; the
-    // socket loop starts, invokes JoinPrivateChannel on the fake hub, and
-    // becomes connected. The poller's first fetch is on schedule 0.
-    for (let i = 0; i < 30; i++) {
-      await vi.advanceTimersByTimeAsync(200);
-      await Promise.resolve();
-      const sent = s.hub.invokes.find((iv) => iv.method === "SendToChannel");
-      if (sent) {
-        expect(sent.args[0]).toBe(forced.ingestChannel);
-        expect(sent.args[1]).toBe("location");
-        const body = sent.args[2] as { lat: number; lng: number };
-        expect(body.lat).toBe(46.91852);
-        expect(body.lng).toBe(-114.090039);
-        await service.stop();
-        return;
-      }
+function scenario() {
+  const hubs = new Map<string, FakeHubClient>();
+  const calls: Array<{ url: string; method: string; body: string | null }> = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+    calls.push({ url, method: init?.method ?? "GET", body: typeof init?.body === "string" ? init.body : null });
+    if (url.startsWith(SOURCE_URL)) return json(SAMPLE);
+    if (url.startsWith("https://legacy.example/mode")) return new Response("ok", { status: 200 });
+    if (url.endsWith("/beacons/heartbeat")) {
+      return json({ receivedAt: new Date().toISOString(), liveEventId: null, isActive: false, stateVersion: 0, serverTime: new Date().toISOString() });
     }
-    await service.stop();
-    throw new Error("hub never received SendToChannel");
+    if (url.endsWith("/locations")) {
+      return json({ seq: 1, published: false, receivedAt: new Date().toISOString(), serverTime: new Date().toISOString() });
+    }
+    return json({}, 404);
+  }) as typeof fetch;
+  const buildHub = (o: HubOptions) => {
+    const hub = new FakeHubClient();
+    hubs.set(o.hubUrl, hub);
+    return hub;
+  };
+  return { hubs, calls, fetchImpl, buildHub };
+}
+
+async function until(cond: () => boolean, ms = 3000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+let service: Service | null = null;
+afterEach(async () => {
+  vi.useRealTimers();
+  await service?.stop();
+  service = null;
+});
+
+async function start(modeControl: Config["modeControl"]) {
+  const s = scenario();
+  service = await startService(config(modeControl), {
+    log: pino({ level: "silent" }),
+    version: "0.2.0",
+    bootMs: Date.now(),
+    instance: "test",
+    fetchImpl: s.fetchImpl,
+    buildHub: s.buildHub,
+    httpPort: 0,
+  });
+  return s;
+}
+
+describe("service wiring (legacy-beacon.md 2)", () => {
+  it("one polled fix reaches both targets' beacon state", async () => {
+    await start(null);
+    await until(() => service!.beacons().every((b) => b.beacon.state.latestFix !== null));
+    for (const { beacon } of service!.beacons()) {
+      expect(beacon.state.latestFix!.lat).toBe(46.91852);
+      expect(beacon.state.latestFix!.speedMps).toBe(4.47);
+    }
   });
 
-  async function settle(ms: number): Promise<void> {
-    await vi.advanceTimersByTimeAsync(ms);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-  }
+  it("each target builds its own hub and the fix goes out on both", async () => {
+    const s = await start(null);
+    await until(() => s.hubs.size === 2 && [...s.hubs.values()].every((h) => h.invokes.length > 0));
+    expect([...s.hubs.keys()].sort()).toEqual(["wss://hub-dev.example.com/hub", "wss://hub.example.com/hub"]);
+    for (const hub of s.hubs.values()) {
+      const sent = hub.invokes[0]!;
+      expect(JSON.stringify(sent.args)).toContain("46.91852");
+    }
+  });
 
-  it("with mode control on, only the leader sends a mode request, and one active, live state with polled 0 sends value 1", async () => {
-    const s = makeScenario();
-    s.setSourceMode(0);
-    const service = startService(
-      { ...CONFIG, modeControl: MODE_CONFIG },
-      {
-        log,
-        version: "0.1.0",
-        bootMs: Date.now(),
-        instance: "test",
-        fetchImpl: s.fetchImpl,
-        buildHub: s.buildHub,
-        healthPort: 0,
-        startHealth: () => ({ port: () => 0, close: async () => {} }),
-      },
-    );
-    service.beacon().state.lastHeartbeat = {
-      receivedAt: new Date().toISOString(),
-      liveEventId: 1,
-      isActive: true,
-      stateVersion: null,
-    };
+  it("heartbeats go to both APIs with their own target", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "setInterval"], shouldAdvanceTime: true });
+    const s = await start(null);
+    await vi.advanceTimersByTimeAsync(15_500);
+    await until(() => {
+      const hb = s.calls.filter((c) => c.url.endsWith("/beacons/heartbeat"));
+      return hb.some((c) => c.url.startsWith("https://api-dev.example.com")) && hb.some((c) => c.url.startsWith("https://api.example.com"));
+    }, 5000);
+    const prod = s.calls.find((c) => c.url === "https://api.example.com/beacons/heartbeat")!;
+    expect(JSON.parse(prod.body!).debug.target).toBe("prod");
+  });
 
-    // A follower makes no mode request, whatever the heartbeat state says.
-    await settle(6000);
-    expect(s.modeRequests()).toHaveLength(0);
+  it("the status lists both targets and the polled mode", async () => {
+    await start(null);
+    await until(() => service!.status().source.pollsOk > 0);
+    const st = service!.status();
+    expect(st.targets.map((t) => t.name)).toEqual(["dev", "prod"]);
+    expect(st.mode.polledMode).toBe(1);
+    expect(st.mode.enabled).toBe(false);
+    expect(st.fix?.lat).toBe(46.91852);
+  });
 
-    // Leader: the first poll reads mode 0 and one request with value 1 goes out.
-    s.setLeader(true);
-    await settle(2100);
-    await settle(1000);
-    const sent = s.modeRequests();
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.searchParams.get("value")).toBe("1");
-    expect(sent[0]!.searchParams.get("id")).toBe("tracker-1");
-    expect(sent[0]!.searchParams.get("auth")).toBe(MODE_CONFIG.auth);
-    // The controller read the state document first and wrote ownership to it.
-    const stateCalls = s.fetchCalls.filter((u) => u.endsWith("/beacons/me/state"));
-    expect(stateCalls.length).toBeGreaterThanOrEqual(2);
-    expect(s.fetchCalls.indexOf(stateCalls[0]!)).toBeLessThan(
-      s.fetchCalls.findIndex(isModeRequest),
-    );
-
-    // Follower again: the controller stops with the poller, so the tracker
-    // still reading 0 brings no further request.
-    s.setLeader(false);
-    await settle(2100);
-    const afterLoss = s.modeRequests().length;
-    await settle(12_000);
-    expect(s.modeRequests().length).toBe(afterLoss);
-    expect(afterLoss).toBeLessThanOrEqual(2);
-
-    await service.stop();
+  it("a mode request through HTTP reaches the tracker with id, auth, and value", async () => {
+    const s = await start({ url: MODE_URL, auth: MODE_AUTH });
+    const port = service!.http().port();
+    const res = await fetch(`http://127.0.0.1:${port}/api/mode`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: 2 }),
+    });
+    expect(res.status).toBe(200);
+    const mode = s.calls.filter((c) => c.url.startsWith("https://legacy.example/mode"));
+    expect(mode).toHaveLength(1);
+    const u = new URL(mode[0]!.url);
+    expect([u.searchParams.get("id"), u.searchParams.get("auth"), u.searchParams.get("value")]).toEqual(["tracker-1", MODE_AUTH, "2"]);
+    const status = (await (await fetch(`http://127.0.0.1:${port}/api/status`)).json()) as { mode: { enabled: boolean; lastSetValue: number } };
+    expect(status.mode.enabled).toBe(true);
+    expect(status.mode.lastSetValue).toBe(2);
+    expect(JSON.stringify(status)).not.toContain(MODE_AUTH);
   });
 
   it("with mode control off no mode request is ever made", async () => {
-    const s = makeScenario();
-    s.setSourceMode(0);
-    const forced: Config = { ...CONFIG, forceLeader: true, gatewayRealtimeToken: null };
-    const service = startService(forced, {
-      log,
-      version: "0.1.0",
-      bootMs: Date.now(),
-      instance: "test",
-      fetchImpl: s.fetchImpl,
-      buildHub: s.buildHub,
-      healthPort: 0,
-      startHealth: () => ({ port: () => 0, close: async () => {} }),
-    });
-    service.beacon().state.lastHeartbeat = {
-      receivedAt: new Date().toISOString(),
-      liveEventId: 1,
-      isActive: true,
-      stateVersion: null,
-    };
-    await settle(12_000);
-    expect(s.fetchCalls.some((u) => u.startsWith(CONFIG.sourceUrl))).toBe(true);
-    expect(s.modeRequests()).toHaveLength(0);
-    await service.stop();
+    const s = await start(null);
+    await until(() => service!.status().source.pollsOk > 2);
+    expect(s.calls.some((c) => c.url.startsWith("https://legacy.example/mode"))).toBe(false);
   });
 });

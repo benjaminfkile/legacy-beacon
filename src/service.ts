@@ -1,36 +1,17 @@
-// Wire the shared beacon-library to this repository's poller and health probe.
-// createBeacon owns the socket loop, the send loop, the heartbeat loop, and the
-// REST client; gateOnLeader starts and stops that beacon as leadership changes,
-// with onStart bringing up the poller as the fix source and onStop tearing it
-// down. When mode control is configured, onStart also brings up the mode
-// controller after the poller, evaluated after every completed poll and on a
-// 1 s backstop interval, and onStop stops it before the poller. One state
-// store over the beacon's REST client lives as long as the service; each mode
-// controller loads ownership from it when created. Extracted from
-// main.ts so a test can drive the wiring with fakes.
+// Wires the service (legacy-beacon.md 2): one poller of the legacy tracker,
+// one beacon core per target (dev and prod), every polled fix handed to every
+// target, the optional mode setter, and the HTTP surface. One process on one
+// host: no leader gate. Fetch, the hub builder, and the HTTP port are
+// injectable for the wiring test.
 
 import type { Logger } from "pino";
-import {
-  createBeacon,
-  createStateStore,
-  gateOnLeader,
-  type Beacon,
-  type BeaconLogger,
-  type HubClient,
-  type HubOptions,
-  type Leader,
-} from "beacon-library";
+import { createBeacon, setLatestFix, type Beacon, type HubClient, type HubOptions } from "beacon-library";
 import type { Config } from "./config.js";
-import { startHealthServer, type HealthProbe, type HealthServer } from "./health.js";
 import { buildHeartbeatDebug, buildHeartbeatHealth } from "./heartbeat.js";
-import {
-  createModeController,
-  type BeaconDocument,
-  type ModeController,
-} from "./source/modeControl.js";
+import { startHttpServer, type HttpServer } from "./http.js";
+import { createModeSetter, type LegacyMode, type ModeSetter } from "./source/modeSetter.js";
 import { createPoller, type Poller } from "./source/poller.js";
-
-const MODE_EVALUATE_MS = 1000;
+import { buildStatus, polledMode, type StatusBody } from "./status.js";
 
 export interface ServiceDeps {
   log: Logger;
@@ -39,126 +20,124 @@ export interface ServiceDeps {
   instance: string;
   fetchImpl?: typeof fetch;
   buildHub?: (o: HubOptions) => HubClient;
-  healthPort?: number;
-  startHealth?: (probe: () => HealthProbe, port: number) => HealthServer;
+  httpPort?: number;
+  now?: () => number;
 }
 
 export interface Service {
   stop(): Promise<void>;
-  leader(): Leader;
-  beacon(): Beacon;
-  health(): HealthServer;
+  http(): HttpServer;
+  poller(): Poller;
+  beacons(): Array<{ name: string; beacon: Beacon }>;
+  status(): StatusBody;
 }
 
-export function startService(config: Config, deps: ServiceDeps): Service {
-  const log = deps.log;
-  const beaconLog: BeaconLogger = {
-    info: (fields, msg) => log.info(fields, msg),
-    warn: (fields, msg) => log.warn(fields, msg),
-    error: (fields, msg) => log.error(fields, msg),
-  };
-
-  let leader: Leader | null = null;
+export async function startService(config: Config, deps: ServiceDeps): Promise<Service> {
+  const { log } = deps;
+  const now = deps.now ?? (() => Date.now());
   let poller: Poller | null = null;
-  let modeController: ModeController | null = null;
-  let modeTimer: ReturnType<typeof setInterval> | null = null;
 
-  function stopModeControl(): void {
-    if (modeTimer) clearInterval(modeTimer);
-    modeTimer = null;
-    modeController?.stop();
-    modeController = null;
-  }
+  const modeSetter: ModeSetter | null = config.modeControl
+    ? createModeSetter({
+        url: config.modeControl.url,
+        auth: config.modeControl.auth,
+        log,
+        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+      })
+    : null;
 
-  const health = (deps.startHealth ?? startHealthServer)(
-    () => ({
-      configLoaded: true,
-      leaderPolledOnce: leader?.polledOnce() ?? false,
-    }),
-    deps.healthPort ?? 3000,
-  );
+  const runtimes = config.targets.map((target) => {
+    const beaconLog = log.child({ target: target.name });
+    const beacon: Beacon = createBeacon({
+      apiBaseUrl: target.apiBaseUrl,
+      beaconKey: target.beaconKey,
+      hubUrl: target.hubUrl,
+      ingestChannel: target.ingestChannel,
+      log: beaconLog,
+      buildHealth: () => buildHeartbeatHealth({ state: beacon.state, pollerStats: poller?.stats() ?? null }),
+      buildDebug: () =>
+        buildHeartbeatDebug({
+          target: target.name,
+          state: beacon.state,
+          sourceUrl: config.sourceUrl,
+          pollMs: config.pollMs,
+          pollerStats: poller?.stats() ?? null,
+          modeStats: modeSetter?.stats() ?? null,
+          bootMs: deps.bootMs,
+          version: deps.version,
+          instance: deps.instance,
+        }),
+      ...(deps.buildHub ? { buildHub: deps.buildHub } : {}),
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    });
+    log.info(
+      { target: target.name, apiBaseUrl: target.apiBaseUrl, ingestChannel: target.ingestChannel },
+      "target configured",
+    );
+    return { name: target.name, apiBaseUrl: target.apiBaseUrl, beacon };
+  });
 
-  const beacon: Beacon = createBeacon({
-    apiBaseUrl: config.apiBaseUrl,
-    beaconKey: config.beaconKey,
-    hubUrl: config.hubUrl,
-    ingestChannel: config.ingestChannel,
-    log: beaconLog,
-    buildHealth: () =>
-      buildHeartbeatHealth({ state: beacon.state, pollerStats: poller?.stats() ?? null }),
-    buildDebug: () =>
-      buildHeartbeatDebug({
-        state: beacon.state,
-        config,
-        pollerStats: poller?.stats() ?? null,
-        bootMs: deps.bootMs,
-        version: deps.version,
-        instance: deps.instance,
-        leader: leader?.isLeader() ?? false,
-        modeControlStats: modeController?.stats() ?? null,
-      }),
-    ...(deps.buildHub ? { buildHub: deps.buildHub } : {}),
+  const activePoller = createPoller({
+    url: config.sourceUrl,
+    pollMs: config.pollMs,
+    onFix: (fix) => {
+      for (const r of runtimes) {
+        setLatestFix(r.beacon.state, fix);
+        r.beacon.wake();
+      }
+    },
     ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
   });
+  poller = activePoller;
 
-  const stateStore = createStateStore<BeaconDocument>({
-    rest: beacon.rest,
-    log: beaconLog,
-    empty: () => ({}),
+  const status = (): StatusBody =>
+    buildStatus({
+      sourceUrl: config.sourceUrl,
+      pollMs: config.pollMs,
+      pollerStats: activePoller.stats(),
+      modeStats: modeSetter?.stats() ?? null,
+      targets: runtimes.map((r) => ({ name: r.name, apiBaseUrl: r.apiBaseUrl, state: r.beacon.state })),
+      bootMs: deps.bootMs,
+      version: deps.version,
+      instance: deps.instance,
+      now: now(),
+    });
+
+  const http = await startHttpServer({
+    host: config.httpHost,
+    port: deps.httpPort ?? config.httpPort,
+    webDir: config.webDir,
+    status,
+    setMode: modeSetter
+      ? (value: LegacyMode) => modeSetter.set(value, polledMode(activePoller.stats(), now()))
+      : null,
+    log,
   });
 
-  leader = gateOnLeader({
-    leader: {
-      gatewayInternalUrl: config.gatewayInternalUrl,
-      realtimeToken: config.gatewayRealtimeToken,
-      forceLeader: config.forceLeader,
-      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+  log.info(
+    {
+      targets: runtimes.map((r) => r.name),
+      pollMs: config.pollMs,
+      modeControl: modeSetter !== null,
+      httpHost: config.httpHost,
+      httpPort: http.port(),
     },
-    beacon,
-    log: beaconLog,
-    onStart: () => {
-      poller = createPoller({
-        url: config.sourceUrl,
-        pollMs: config.pollMs,
-        state: beacon.state,
-        onFix: () => beacon.wake(),
-        onPolled: () => modeController?.evaluate(),
-        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-      });
-      if (config.modeControl) {
-        stopModeControl();
-        const p = poller;
-        modeController = createModeController({
-          url: config.modeControl.url,
-          auth: config.modeControl.auth,
-          state: beacon.state,
-          store: stateStore,
-          pollerStats: () => p.stats(),
-          log: beaconLog,
-          ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-        });
-        modeTimer = setInterval(() => modeController?.evaluate(), MODE_EVALUATE_MS);
-      }
-      poller.start();
-    },
-    onStop: () => {
-      stopModeControl();
-      poller?.stop();
-      poller = null;
-    },
-  });
+    "legacy beacon starting",
+  );
+
+  for (const r of runtimes) r.beacon.start();
+  activePoller.start();
 
   return {
-    leader: () => leader!,
-    beacon: () => beacon,
-    health: () => health,
-    async stop() {
-      leader?.stop();
-      stopModeControl();
-      poller?.stop();
-      poller = null;
-      await beacon.stop();
-      await health.close();
+    async stop(): Promise<void> {
+      activePoller.stop();
+      modeSetter?.stop();
+      await Promise.all(runtimes.map((r) => r.beacon.stop()));
+      await http.close();
     },
+    http: () => http,
+    poller: () => activePoller,
+    beacons: () => runtimes.map((r) => ({ name: r.name, beacon: r.beacon })),
+    status,
   };
 }

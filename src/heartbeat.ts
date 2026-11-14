@@ -1,14 +1,11 @@
-// Build the heartbeat's `health` core and `debug` object per
-// legacy-beacon.md section 5. `health.socketState` is the socket's state,
+// Builds the heartbeat's `health` core and `debug` object for one target
+// (legacy-beacon.md 5). `health.socketState` is that target's socket state,
 // `health.lastFixAgeS` the age of the last successful poll (so a dead source
 // shows as "no recent fix" on the panel), `batteryPercent` absent. `debug` is
-// the section 5 tree, including the mode controller's state; it is stored
-// verbatim by the API and rendered by the panel as a themed JSON tree.
+// the section 5 tree; the API stores it verbatim and the panel renders it.
 
 import type { BeaconState, HealthCore } from "beacon-library";
-import type { Config } from "./config.js";
-import { normalize } from "./source/normalize.js";
-import type { ModeControlStats } from "./source/modeControl.js";
+import type { ModeSetterStats } from "./source/modeSetter.js";
 import type { PollerStats } from "./source/poller.js";
 
 export interface HeartbeatHealthInput {
@@ -19,108 +16,53 @@ export interface HeartbeatHealthInput {
 
 export function buildHeartbeatHealth(input: HeartbeatHealthInput): HealthCore {
   const now = input.now ?? (() => Date.now());
-  const lastFixAgeS =
-    input.pollerStats?.lastSuccessAtMs !== undefined &&
-    input.pollerStats?.lastSuccessAtMs !== null
-      ? Math.max(0, (now() - input.pollerStats.lastSuccessAtMs) / 1000)
-      : null;
+  const last = input.pollerStats?.lastSuccessAtMs ?? null;
   return {
-    lastFixAgeS,
+    lastFixAgeS: last !== null ? Math.max(0, (now() - last) / 1000) : null,
     socketState: input.state.socketState,
   };
 }
 
 export interface HeartbeatDebugInput {
+  target: string;
   state: BeaconState;
-  config: Config;
+  sourceUrl: string;
+  pollMs: number;
   pollerStats: PollerStats | null;
+  // The mode setter's stats; null when mode control is off.
+  modeStats: ModeSetterStats | null;
   bootMs: number;
   version: string;
   instance: string;
-  leader: boolean;
-  // The running mode controller's stats; null when none runs on this node.
-  modeControlStats?: ModeControlStats | null;
   now?: () => number;
-}
-
-export type HeartbeatModeControl =
-  | ModeControlStats
-  | { enabled: true; owned: false; wanted: null }
-  | { enabled: false };
-
-export interface HeartbeatDebug {
-  source: {
-    url: string;
-    pollMs: number;
-    lastPollAt: string | null;
-    lastStatus: number | null;
-    lastLatencyMs: number | null;
-    consecutiveFailures: number;
-    pollsOk: number;
-    pollsFailed: number;
-    mode: unknown;
-    lastPayload: Record<string, unknown> | null;
-  };
-  normalized: {
-    lat: number | null;
-    lng: number | null;
-    speedMps: number | null;
-    altitudeM: number | null;
-    headingDeg: number | null;
-    recordedAt: string | null;
-  };
-  transport: {
-    socketState: string;
-    reconnectCount: number;
-    httpFallbackSeconds: number;
-    lastReceiptLatencyMs: number | null;
-    sendsFailedSinceBoot: number;
-  };
-  process: {
-    uptimeS: number;
-    leader: boolean;
-    instance: string;
-    version: string;
-    node: string;
-  };
-  modeControl: HeartbeatModeControl;
 }
 
 export function buildHeartbeatDebug(input: HeartbeatDebugInput): Record<string, unknown> {
   const now = input.now ?? (() => Date.now());
   const stats = input.pollerStats;
   const lastPayload = stats?.lastPayload ?? null;
-  const modeRaw = lastPayload && typeof lastPayload === "object" ? lastPayload.mode : undefined;
-  const normalizedFix = lastPayload
-    ? normalize(lastPayload, { pollTimeMs: stats?.lastPollAtMs ?? now() })
-    : null;
-  const n = normalizedFix && normalizedFix.ok ? normalizedFix.fix : null;
-  // Off when not configured; configured but idle on a node that does not run
-  // the controller; otherwise the controller's own stats.
-  const modeControl: HeartbeatModeControl =
-    input.config.modeControl === null
-      ? { enabled: false }
-      : (input.modeControlStats ?? { enabled: true, owned: false, wanted: null });
+  const fix = stats?.lastFix ?? null;
   return {
+    target: input.target,
     source: {
-      url: input.config.sourceUrl,
-      pollMs: input.config.pollMs,
+      url: input.sourceUrl,
+      pollMs: input.pollMs,
       lastPollAt: stats?.lastPollAt ?? null,
       lastStatus: stats?.lastStatus ?? null,
       lastLatencyMs: stats?.lastLatencyMs ?? null,
       consecutiveFailures: stats?.consecutiveFailures ?? 0,
       pollsOk: stats?.pollsOk ?? 0,
       pollsFailed: stats?.pollsFailed ?? 0,
-      mode: modeRaw ?? null,
+      mode: lastPayload?.mode ?? null,
       lastPayload,
     },
     normalized: {
-      lat: n?.lat ?? null,
-      lng: n?.lng ?? null,
-      speedMps: n?.speedMps ?? null,
-      altitudeM: n?.altitudeM ?? null,
-      headingDeg: n?.headingDeg ?? null,
-      recordedAt: n?.recordedAt ?? null,
+      lat: fix?.lat ?? null,
+      lng: fix?.lng ?? null,
+      speedMps: fix?.speedMps ?? null,
+      altitudeM: fix?.altitudeM ?? null,
+      headingDeg: fix?.headingDeg ?? null,
+      recordedAt: fix?.recordedAt ?? null,
     },
     transport: {
       socketState: input.state.socketState,
@@ -131,11 +73,10 @@ export function buildHeartbeatDebug(input: HeartbeatDebugInput): Record<string, 
     },
     process: {
       uptimeS: Math.max(0, Math.round((now() - input.bootMs) / 1000)),
-      leader: input.leader,
       instance: input.instance,
       version: input.version,
       node: process.version,
     },
-    modeControl,
+    modeControl: input.modeStats ?? { enabled: false },
   };
 }

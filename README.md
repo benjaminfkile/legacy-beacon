@@ -1,6 +1,6 @@
 # legacy-beacon
 
-The WMSFO v2 legacy beacon: an enrolled beacon that polls the legacy Heroku tracker once a second and posts what it reports, normalized to the API's location body. A Node and TypeScript service on the fleet behind the gateway with no user interface.
+The WMSFO v2 legacy beacon: one service that polls the legacy Heroku tracker once a second and posts what it reports, normalized to the API's location body, to both dev and prod as an enrolled beacon in each. It has a control page on the local network for the tracker's mode and the two beacons, and runs as a systemd service on one host that starts at boot with no login.
 
 Read `docs/` before touching anything:
 
@@ -10,48 +10,22 @@ Read `docs/` before touching anything:
 
 ## Run, test, build
 
-Requires Node 22 or newer. `npm ci` installs dependencies.
+Requires Node 22 or newer. In the root (the service) and again in `web/` (the control page): `npm ci`, then `npm test`, `npm run typecheck`, `npm run build`; `npm run lint` in `web/`.
 
 | Command | What it does |
 |---|---|
-| `npm test` | Vitest suites for the config, the normalizer, the poller, the beacon loops, and the heartbeat body shape. |
-| `npm run typecheck` | `tsc --noEmit` against `tsconfig.json` (src and tests). |
-| `npm run build` | `tsc -p tsconfig.build.json`; emits `dist/` for the container. |
-| `npm run dev` | Runs `src/main.ts` under `ts-node`; polls the real Heroku endpoint and posts into whatever `LB_API_BASE_URL` names (see below). |
-| `npm start` | Runs the built service from `dist/`. |
+| `npm test` | Vitest suites for the config, the normalizer, the poller, the mode setter, the HTTP surface, the heartbeat body, and the wiring. |
+| `npm run build` | `tsc -p tsconfig.build.json`; emits `dist/`. `npm run build:web` builds the page into `web/dist`. |
+| `npm run dev` | Runs `src/main.ts` under `ts-node` with the `LB_*` keys from the environment. |
+| `npm start` | Runs the built service from `dist/`; it serves the page from `web/dist`. |
 | `npm run contracts:check` | Verifies `contracts/` matches `wmsfo-api` at the pinned `CONTRACTS_SHA`. |
 | `npm run beacon:check` | Verifies the vendored `beacon-library` tarball, its recorded SHA-256, and the pinned `BEACON_LIBRARY_SHA` still line up. |
+| `npm run dev` in `web/` | The page on port 5176 with `/api` proxied to `http://localhost:3070`. |
 
-## Local recipe (legacy-beacon.md §8)
+## Install on the host (legacy-beacon.md 7)
 
-Create `.env.local` at the repo root with the dev configuration:
+1. Clone the repository on `main` as the user the service runs as.
+2. Write `/etc/legacy-beacon/legacy-beacon.env` with the keys of legacy-beacon.md 6 (owner root, group that user, mode 0640).
+3. Run `scripts/install-service.sh`. It builds the service and the page, installs `/etc/systemd/system/legacy-beacon.service`, enables it, and restarts it.
 
-```
-LB_ENV=dev
-LB_API_BASE_URL=https://<dev-api-domain>
-LB_BEACON_KEY=wbk_<the key minted in the panel for the beacon named "legacy-tracker">
-LB_HUB_URL=wss://<dev-gateway-domain>/hub
-LB_INGEST_CHANNEL=wmsfo-api-dev:ingest
-LB_GATEWAY_INTERNAL_URL=http://localhost:1
-LB_SOURCE_URL=https://<legacy-tracker-host>/get?id=<tracker id>
-LB_POLL_MS=1000
-LB_LOG_LEVEL=info
-LB_FORCE_LEADER=true
-# LB_MODE_URL=https://<legacy-tracker-host>/mode?id=<tracker id>
-# LB_MODE_AUTH=<mode token>
-```
-
-`LB_GATEWAY_INTERNAL_URL=http://localhost:1` and `LB_FORCE_LEADER=true` let the service run without a gateway: the forced leader never polls `/internal/leader`, so `GATEWAY_REALTIME_TOKEN` is not required in this mode (it is required in every other run; see legacy-beacon.md §6). `LB_FORCE_LEADER=true` is refused when `LB_ENV=prod`.
-
-Mode control keeps its ownership in the beacon's state document on the API (legacy-beacon.md §3); there is nothing new to configure.
-
-Load the file and run the dev command:
-
-```
-set -a; source .env.local; set +a
-npm run dev
-```
-
-The service polls the real Heroku endpoint once a second, normalizes each answer, and posts it to dev over the hub (falling back to `POST /locations` while the socket is down). The dev beacon should be enrolled as a spare, so its rows are stored but never published unless someone activates it.
-
-The reviewer's local checklist runs this recipe against dev with the `legacy-tracker` beacon key and watches the admin panel's beacon row for heartbeats carrying the Heroku payload in the `debug` tree and, while the dev event is live, unpublished location rows on the beacon.
+Update later with `scripts/install-service.sh --pull`. Logs: `journalctl -u legacy-beacon`. Page: `http://<host>:3070/`.
