@@ -110,7 +110,7 @@ type StatusBody = {
 
 - **Tracker mode**: the polled mode (RUN-SHOW green, END-SHOW amber, PRE-SHOW neutral, "mode unknown" red), three buttons PRE-SHOW, RUN-SHOW, END-SHOW with the current one marked; a click shows an inline confirmation naming the mode, and Confirm sends `POST /api/mode`. The last request's mode, time, and answer (or error) show under the buttons. With mode control off the buttons are disabled and a line says so.
 - **Tracker**: position, speed in mph, altitude in feet, heading, fix time, the tracker's own `status` string, the last good poll's age, latency, poll counts, and the raw payload in a collapsed block.
-- **Beacons**: one panel per target: socket state, Active or Spare, the live event or "no live event", heartbeat age, delivered fixes (with "sending" while the latest is not yet delivered), receipt latency, sends failed, reconnects and HTTP fallback seconds, and a red banner when the key is revoked.
+- **Beacons**: one panel per target: socket state, Active or Spare, the live event or "no live event", heartbeat age, delivered fixes (with "sending" while the latest is not yet delivered and an event is live, "held (no live event)" while the API refuses it for having none), receipt latency, sends failed, reconnects and HTTP fallback seconds, and a red banner when the key is revoked.
 - A line at the top when the service stops answering, with the age of the last answer.
 
 Styling: the site's token file copied (`tokens.css`, dark and light by `prefers-color-scheme`), Plex Sans and Mono; no UI library. `npm run dev` in `web/` serves the page on port 5176 and proxies `/api` to `http://localhost:3070` (`LB_API_PROXY` overrides).

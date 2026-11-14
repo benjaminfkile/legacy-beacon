@@ -20,7 +20,11 @@ function socketPillClass(state: string): string {
 }
 
 function Target({ t, nowMs }: { t: TargetStatus; nowMs: number }) {
+  // A fix that is not delivered while the API has no live event is refused by
+  // design (no_live_event) and held, not failing; only with a live event is it
+  // still on its way.
   const behind = t.latestSeqLocal !== null && t.latestSeqLocal !== t.lastDeliveredSeqLocal;
+  const pending = !behind ? "" : t.liveEventId === null ? ", held (no live event)" : ", sending";
   return (
     <article className={styles.target} aria-label={`${t.name} beacon`}>
       <h3 className={styles.targetName}>{t.name}</h3>
@@ -39,7 +43,7 @@ function Target({ t, nowMs }: { t: TargetStatus; nowMs: number }) {
         <span className={styles.value}>{formatAge(t.lastHeartbeatAt, nowMs)}</span>
         <span className={styles.label}>Fixes</span>
         <span className={styles.value}>
-          {t.lastDeliveredSeqLocal.toLocaleString()} delivered{behind ? ", sending" : ""}
+          {t.lastDeliveredSeqLocal.toLocaleString()} delivered{pending}
         </span>
         <span className={styles.label}>Receipt</span>
         <span className={styles.value}>

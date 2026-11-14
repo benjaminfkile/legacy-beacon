@@ -32,6 +32,17 @@ describe("App (legacy-beacon.md 4)", () => {
     expect(within(prod).getByText("9 delivered, sending")).toBeInTheDocument();
   });
 
+  it("an undelivered fix with no live event reads as held, not sending", async () => {
+    const base = statusFixture();
+    const api = client({
+      getStatus: vi.fn(async () =>
+        statusFixture({ targets: [{ ...base.targets[1]!, name: "prod", liveEventId: null, lastDeliveredSeqLocal: 0 }] }),
+      ),
+    });
+    render(<App api={api} />);
+    expect(await screen.findByText("0 delivered, held (no live event)")).toBeInTheDocument();
+  });
+
   it("a mode button asks first and sends only on Confirm", async () => {
     const api = client();
     render(<App api={api} />);
